@@ -1,0 +1,12 @@
+[toolchain]
+# Kept in step with wack/multitool so local dev and CI build on the same
+# compiler. wack/gh-actions/setup-rust reads this channel and installs it.
+channel = "1.98.1"
+# The "default" profile adds the components:
+# "clippy", "rustfmt", "rustdocs", "rustc", "cargo", and "ruststd".
+# "llvm-tools-preview" is required by cargo-llvm-cov (ci-flow's coverage step
+# in on-merge.yml). Declaring it here provisions it onto this pinned toolchain
+# so cargo-llvm-cov doesn't have to `rustup component add` it lazily at build
+# time.
+components = ["rust-analyzer", "rust-src", "llvm-tools-preview"]
+profile = "default"

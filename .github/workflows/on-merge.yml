@@ -1,0 +1,82 @@
+name: "On Merge | Validate Build"
+
+on:
+  # The merge queue gates trunk; this is the comprehensive tier.
+  merge_group:
+  # Allow this workflow to be executed manually from the GH UI.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  # Single required-check context for the merge queue. Keep this job's name
+  # ("⚡ PR Ready") identical to the one in on-push.yml.
+  pr-ready:
+    if: always()
+    name: "⚡ PR Ready"
+    runs-on: ubuntu-22.04
+    needs:
+      - "format"
+      - "build"
+      - "grafeo"
+    steps:
+      - if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
+        run: |
+          echo "One or more dependent jobs failed, was skipped, or was cancelled. All jobs must pass for the PR to be ready."
+          exit 1
+      - run: echo "OK"
+
+  # Fast-fail formatting gate (cheap; surfaces a formatting miss before the
+  # heavier build job finishes). See on-push.yml for why we use setup-rust
+  # without forcing a toolchain and without a CROSS_REPO_PAT.
+  format:
+    name: Check Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Setup Rust
+        uses: "wack/gh-actions/setup-rust@trunk"
+      - name: Check formatting
+        run: cargo make check-format
+
+  # Full validation. `ci-flow` bundles pre-build checks, format, clippy, build,
+  # docs, the test suite (including the TCK baseline gate), AND llvm-cov
+  # coverage in one task, so there is no separate coverage job.
+  build:
+    name: Validate Rust Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Setup Rust
+        uses: "wack/gh-actions/setup-rust@trunk"
+        with:
+          # ci-flow collects coverage with cargo-llvm-cov, so it must be
+          # installed alongside cargo-make. No cargo-nextest: the TCK harness
+          # can't run under it (see [tasks.test] in Makefile.toml).
+          shared-key: rust-ci
+          extra-tools: cargo-llvm-cov
+      - name: Cargo Make
+        run: cargo make ci-flow
+
+  # Validates the `grafeo` feature: clippy plus the full test suite with the
+  # feature on, which adds the differential oracle against Grafeo
+  # (tests/oracle.rs). A separate job from `build` so it runs in parallel
+  # instead of serializing after `build`'s docs + coverage steps.
+  grafeo:
+    name: Validate Grafeo Feature
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Setup Rust
+        uses: "wack/gh-actions/setup-rust@trunk"
+        with:
+          shared-key: rust-ci-grafeo
+      - name: Cargo Make
+        run: cargo make ci-grafeo-flow

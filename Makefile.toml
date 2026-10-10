@@ -1,0 +1,121 @@
+[config]
+default_to_workspace = false
+
+[env]
+CARGO_MAKE_CARGO_BUILD_TEST_FLAGS = ""
+
+[tasks.dev-test-flow]
+dependencies = [
+  "pre-build",
+  "format-flow",
+  "clippy-flow",
+  "build",
+  "post-build",
+  "pre-docs",
+  "docs",
+  "post-docs",
+  "test-flow",
+]
+
+[tasks.pre-build]
+dependencies = ["format-toml-conditioned-flow", "unused-dependencies-flow"]
+
+# Canonical clippy command — the single source of truth shared by CI
+# (on-push.yml's clippy job and on-merge.yml's ci-flow -> clippy-flow).
+# Overrides cargo-make's built-in `clippy` task so every path runs the
+# IDENTICAL command. `-- -D warnings` makes any clippy or rustc warning fail
+# CI, so a clean local run predicts a clean CI clippy run exactly.
+[tasks.clippy]
+description = "Canonical clippy command — shared by CI (on-push, ci-flow)."
+category = "Development"
+workspace = false
+command = "cargo"
+args = ["clippy", "--all-targets", "--workspace", "--locked", "--", "-D", "warnings"]
+
+# The Grafeo differential oracle (tests/oracle.rs) and its dependency live
+# behind the `grafeo` Cargo feature, off by default, so they rot unless CI
+# also builds, lints, and tests them. Byte-for-byte [tasks.clippy] plus
+# `--features grafeo`. Kept separate from `clippy` so the two feature sets
+# stay independently attributable in CI output.
+[tasks.clippy-grafeo]
+description = "Canonical clippy command for the grafeo feature."
+category = "Development"
+workspace = false
+command = "cargo"
+args = ["clippy", "--all-targets", "--workspace", "--locked", "--features", "grafeo", "--", "-D", "warnings"]
+
+[tasks.ci-flow]
+dependencies = [
+  "pre-ci-flow",
+  "print-env-flow",
+  "pre-build",
+  "check-format-flow",
+  "clippy-flow",
+  "build",
+  "post-build",
+  "pre-docs",
+  "docs",
+  "post-docs",
+  "test-flow",
+  "coverage-flow",
+  "post-ci-flow",
+]
+
+# Unlike multitool, this uses the built-in libtest runner rather than
+# cargo-nextest: the TCK gate (tests/tck, `harness = false`) has its own
+# `main` and can't answer nextest's `--list` probe, so nextest refuses to run
+# the suite at all.
+[tasks.test]
+workspace = false
+description = "Run our test suite (unit, profile, spec and the TCK gate)"
+command = "cargo"
+args = [
+  "test",
+  "--locked",
+  "@@remove-empty(CARGO_MAKE_CARGO_VERBOSE_FLAGS)",
+  "@@split(CARGO_MAKE_CARGO_BUILD_TEST_FLAGS, )",
+]
+
+# Coverage for ci-flow's coverage-flow. cargo-make's built-in providers are
+# only kcov and tarpaulin (an unrecognised CARGO_MAKE_COVERAGE_PROVIDER falls
+# back to building kcov from source), so this overrides `coverage` to call
+# cargo-llvm-cov directly. setup-rust installs it via `extra-tools`, and
+# rust-toolchain.toml provisions llvm-tools-preview.
+[tasks.coverage]
+clear = true
+workspace = false
+description = "Collect test coverage with cargo-llvm-cov (lcov at target/lcov.info)"
+command = "cargo"
+args = [
+  "llvm-cov",
+  "--locked",
+  "--lcov",
+  "--output-path",
+  "target/lcov.info",
+]
+
+# Same suite with the `grafeo` feature, which additionally runs the
+# differential oracle against Grafeo. The oracle fails on any disagreement not
+# triaged into KNOWN_DIVERGENCES, so this is a real gate.
+[tasks.test-grafeo]
+workspace = false
+description = "Run our test suite with the grafeo feature (adds the Grafeo oracle)"
+command = "cargo"
+args = [
+  "test",
+  "--locked",
+  "--features",
+  "grafeo",
+  "@@remove-empty(CARGO_MAKE_CARGO_VERBOSE_FLAGS)",
+  "@@split(CARGO_MAKE_CARGO_BUILD_TEST_FLAGS, )",
+]
+
+# Bundles clippy-grafeo + test-grafeo behind one task so CI's grafeo job (see
+# on-merge.yml) has a single command to call, mirroring how `ci-flow` bundles
+# the default-feature checks. Kept out of `ci-flow` so it runs as its own
+# parallel CI job instead of serializing after build/docs/coverage.
+[tasks.ci-grafeo-flow]
+dependencies = ["clippy-grafeo", "test-grafeo"]
+
+[tasks.fmt]
+alias = "format"
