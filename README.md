@@ -65,6 +65,13 @@ override `nodes_with_label`. Iteration must be deterministic.
 
 ## Testing
 
+CI runs the [cargo-make](https://github.com/sagiegurari/cargo-make) tasks in
+`Makefile.toml`. Run the same tasks locally to predict CI: `cargo make
+check-format`, `cargo make clippy`, `cargo make test`, the `grafeo` variants
+`cargo make clippy-grafeo` and `cargo make test-grafeo`, or the full `cargo make
+ci-flow`. Pull requests get the fast format and clippy gate, and the merge queue
+runs the full suite with coverage. To work with individual scenarios:
+
 ```
 cargo test                                    # unit, profile and TCK gate
 TCK_VERBOSE=1 cargo test --test tck           # list every non-passing scenario
