@@ -1,10 +1,16 @@
 //! Storage abstraction. The evaluator only talks to a [`GraphStore`], so SLCR
 //! can back queries with its own in-memory specification graph; the
-//! [`petgraph`](PetgraphStore) implementation is the reference backend.
+//! [`petgraph`](PetgraphStore) implementation is the reference backend. With
+//! the `turso` feature, [`TursoStore`] keeps the graph in a Turso database,
+//! in memory or in a file.
 
 mod petgraph_store;
+#[cfg(feature = "turso")]
+pub mod turso_store;
 
 pub use petgraph_store::PetgraphStore;
+#[cfg(feature = "turso")]
+pub use turso_store::{TursoLocation, TursoStore, TursoStoreError};
 
 use crate::value::Value;
 use std::collections::BTreeMap;

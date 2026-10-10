@@ -26,6 +26,8 @@ pub use fixture::load_fixture;
 pub use parser::{parse_fixture, parse_query};
 pub use spec::{SpecError, SpecIndex, apply_overlay, load_spec};
 pub use store::{GraphStore, GraphStoreMut, PetgraphStore};
+#[cfg(feature = "turso")]
+pub use store::{TursoLocation, TursoStore, TursoStoreError};
 pub use value::Value;
 
 /// Parse, check and evaluate `text` against `store`.

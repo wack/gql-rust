@@ -12,12 +12,16 @@
 //! `cargo test --test tck` fails on any `wrong` and on any scenario that was
 //! `pass` in `tck/baseline.tsv` but no longer is. Set TCK_UPDATE_BASELINE=1 to
 //! rewrite the baseline; set TCK_VERBOSE=1 to list non-passing scenarios;
-//! TCK_FILTER=<substring> limits the run.
+//! TCK_FILTER=<substring> limits the run. TCK_STORE=turso runs every scenario
+//! against an in-memory `TursoStore` (needs `--features turso`) instead of the
+//! reference `PetgraphStore`, against the same baseline.
 
 mod gherkin;
 mod values;
 
-use slcr_gql::{Error, GraphStore, Params, PetgraphStore, QueryResult, load_fixture, query};
+use slcr_gql::{
+    Error, GraphStore, GraphStoreMut, Params, PetgraphStore, QueryResult, load_fixture, query,
+};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -69,9 +73,18 @@ fn features(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 struct Run {
-    store: PetgraphStore,
+    store: Box<dyn GraphStoreMut>,
     params: Params,
     result: Option<Result<QueryResult, Error>>,
+}
+
+fn new_store() -> Box<dyn GraphStoreMut> {
+    match std::env::var("TCK_STORE").as_deref() {
+        Err(_) | Ok("petgraph") => Box::new(PetgraphStore::new()),
+        #[cfg(feature = "turso")]
+        Ok("turso") => Box::new(slcr_gql::TursoStore::in_memory().expect("open turso store")),
+        Ok(other) => panic!("unknown TCK_STORE `{other}` (is its feature enabled?)"),
+    }
 }
 
 fn named_graph(name: &str) -> Option<String> {
@@ -146,7 +159,7 @@ fn compare(
 
 fn run_scenario(s: &gherkin::Scenario) -> Outcome {
     let mut run = Run {
-        store: PetgraphStore::new(),
+        store: new_store(),
         params: Params::new(),
         result: None,
     };
@@ -159,13 +172,13 @@ fn run_scenario(s: &gherkin::Scenario) -> Outcome {
             | "the omitted graph"
             | "the empty-person graph"
             | "an empty catalog" => {
-                run.store = PetgraphStore::new();
+                run.store = new_store();
             }
             t if t.starts_with("the ") && t.ends_with(" graph") => {
                 let name = &t[4..t.len() - 6];
                 match named_graph(name) {
                     Some(src) => {
-                        if let Err(e) = load_fixture(&mut run.store, &src) {
+                        if let Err(e) = load_fixture(run.store.as_mut(), &src) {
                             return Outcome::Rejected(format!("named graph {name}: {e}"));
                         }
                     }
@@ -173,7 +186,7 @@ fn run_scenario(s: &gherkin::Scenario) -> Outcome {
                 }
             }
             "having executed" => {
-                if let Err(e) = load_fixture(&mut run.store, doc) {
+                if let Err(e) = load_fixture(run.store.as_mut(), doc) {
                     return Outcome::Rejected(format!("fixture: {e}"));
                 }
             }
@@ -187,7 +200,7 @@ fn run_scenario(s: &gherkin::Scenario) -> Outcome {
                 }
             }
             "executing query" => {
-                run.result = Some(query(&run.store, doc, &run.params));
+                run.result = Some(query(run.store.as_ref(), doc, &run.params));
                 if let Some(Err(Error::Unsupported { feature, .. })) = &run.result {
                     return Outcome::Rejected(format!("unsupported: {feature}"));
                 }
@@ -211,8 +224,13 @@ fn run_scenario(s: &gherkin::Scenario) -> Outcome {
                     if step.table.is_empty() {
                         return Outcome::Rejected("result table missing".into());
                     }
-                    if let Err(msg) = compare(&r, &run.store, &step.table, ordered, unordered_lists)
-                    {
+                    if let Err(msg) = compare(
+                        &r,
+                        run.store.as_ref(),
+                        &step.table,
+                        ordered,
+                        unordered_lists,
+                    ) {
                         if msg.contains("TCK value")
                             || msg.starts_with("expected `")
                             || msg.contains("unrecognised")
@@ -278,7 +296,8 @@ fn main() {
             println!("{:8} {id}\n         {}", o.tag(), o.detail());
         }
     }
-    println!("\nSLCR GQL profile — TCK summary");
+    let store = std::env::var("TCK_STORE").unwrap_or_else(|_| "petgraph".into());
+    println!("\nSLCR GQL profile — TCK summary ({store} store)");
     for suite in ["opencypher", "opengql"] {
         let get = |t| counts.get(&(suite, t)).copied().unwrap_or(0);
         println!(

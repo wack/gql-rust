@@ -12,6 +12,9 @@ petgraph = "=0.8.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2"
+# Default features are off: they install mimalloc as the global allocator,
+# which a library must not impose on its users.
+turso = { version = "=0.8.2", default-features = false, optional = true }
 
 [[test]]
 name = "tck"
@@ -19,3 +22,8 @@ harness = false
 
 [features]
 grafeo = ["dep:grafeo"]
+turso = ["dep:turso"]
+
+[[example]]
+name = "turso"
+required-features = ["turso"]
