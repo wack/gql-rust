@@ -1,0 +1,107 @@
+{
+  "$schema": "https://slcr.io/reference/schemas/spec/v1.schema.json",
+  "formatVersion": "1",
+  "spec": { "name": "todo-api" },
+  "root": {
+    "kind": "section", "id": "SEC-001", "title": "TodoList API",
+    "body": "A REST web application in MVC layout with one resource.",
+    "children": [
+      {
+        "kind": "section", "id": "SEC-002", "title": "Views",
+        "body": "The API surface.",
+        "children": [
+          {
+            "kind": "requirement", "id": "REQ-001", "title": "TodoListItem endpoint",
+            "body": "There MUST be an endpoint for the TodoListItem resource.",
+            "modality": "MUST", "refinement": "AND",
+            "children": [
+              {
+                "kind": "requirement", "id": "REQ-002", "title": "POST creates an item",
+                "body": "The endpoint MUST accept POST to create an item.",
+                "modality": "MUST", "refinement": "AND", "refines": ["REQ-001"],
+                "children": [
+                  {
+                    "kind": "requirement", "id": "REQ-004", "title": "Request is authenticated",
+                    "body": "The request MUST be authenticated.",
+                    "modality": "MUST", "refines": ["REQ-002", "REQ-003"]
+                  }
+                ]
+              },
+              {
+                "kind": "requirement", "id": "REQ-003", "title": "GET reads an item",
+                "body": "The endpoint MUST accept GET to read an item.",
+                "modality": "MUST", "refinement": "AND", "refines": ["REQ-001"]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "kind": "section", "id": "SEC-003", "title": "Controllers",
+        "children": [
+          {
+            "kind": "requirement", "id": "REQ-005", "title": "TodoListItem controller",
+            "body": "There MUST be a controller for TodoListItem.",
+            "modality": "MUST", "refinement": "AND",
+            "dependsOn": ["REQ-001", "REQ-007"],
+            "children": [
+              {
+                "kind": "requirement", "id": "REQ-006", "title": "Validates the request payload",
+                "body": "The controller MUST validate the request payload.",
+                "modality": "MUST", "refines": ["REQ-005"]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "kind": "section", "id": "SEC-004", "title": "Models",
+        "body": "Persistence assumptions.",
+        "children": [
+          {
+            "kind": "requirement", "id": "REQ-007", "title": "Table todo_list_item exists",
+            "body": "There MUST be a table `todo_list_item` with columns `title` (string) and `done` (bool).",
+            "modality": "MUST", "usesTerm": ["TERM-001"],
+            "acceptanceCriteria": [
+              {
+                "kind": "acceptanceCriterion", "id": "AC-001", "title": "Table schema is declared",
+                "body": "A table named `todo_list_item` is declared with a string column `title` and a boolean column `done`. A structural match against the schema or migration source is sufficient."
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "kind": "section", "id": "SEC-005", "title": "Authentication",
+        "children": [
+          {
+            "kind": "requirement", "id": "REQ-008", "title": "Accepts authentication tokens",
+            "body": "The API MUST accept OAuth tokens or API keys.",
+            "modality": "MUST", "refinement": "OR",
+            "children": [
+              {
+                "kind": "requirement", "id": "REQ-009", "title": "Accepts OAuth tokens",
+                "body": "The API MAY accept OAuth tokens.",
+                "modality": "MAY", "refines": ["REQ-008"]
+              },
+              {
+                "kind": "requirement", "id": "REQ-010", "title": "Accepts API keys",
+                "body": "The API MAY accept API keys.",
+                "modality": "MAY", "refines": ["REQ-008"]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "glossary": {
+    "kind": "section", "id": "SEC-006", "title": "Glossary",
+    "terms": [
+      {
+        "kind": "term", "id": "TERM-001", "title": "TodoListItem",
+        "definition": "A single item on a to-do list, with a title and a done flag."
+      }
+    ]
+  }
+}

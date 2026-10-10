@@ -1,0 +1,3 @@
+# Vendored conformance suites (Apache-2.0). Update with scripts/update-tck.sh.
+opencypher https://github.com/opencypher/openCypher 677cbafabb8c3c5eed458fd3b1ec0daec8d67d23 tck/features tck/graphs
+opengql    https://github.com/opengql/tck           e0700a7aeb3c7528b9dc47cd67bc5f1187dd8226 features data
