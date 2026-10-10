@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://slcr.io/reference/schemas/spec/v1.schema.json",
+  "title": "SLCR requirements document",
+  "description": "Serialized form of one SLCR specification. The `contains` tree is encoded as JSON nesting: array position is sibling order. The cross edges `refines`, `dependsOn`, and `usesTerm` are ID references held on their source node. Only `refines` affects satisfaction; every relation may contribute context. Derived data (status, renders, slices) is not part of this format. Canonical form omits optional fields that are empty; arrays that are present are non-empty. Invariants JSON Schema cannot express are listed in `x-checkInvariants` and enforced by `check`.",
+  "type": "object",
+  "required": ["formatVersion", "spec", "root", "glossary"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string", "format": "uri-reference" },
+    "formatVersion": {
+      "description": "Version of this serialization format, not of the specification's content.",
+      "const": "1"
+    },
+    "spec": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "description": "Specification name; the qualifier in references such as `todo-api/REQ-002` (qualifier scheme still open).",
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        }
+      }
+    },
+    "root": {
+      "description": "The root Section: the top of the containment tree.",
+      "$ref": "#/$defs/section"
+    },
+    "glossary": {
+      "description": "The auto-created Glossary Section. Logically the root's last child; held here because it is fixed and contains only Terms.",
+      "$ref": "#/$defs/glossary"
+    }
+  },
+
+  "$defs": {
+    "sectionId":     { "type": "string", "pattern": "^SEC-(?:[0-9]{3}|[1-9][0-9]{3,})$" },
+    "requirementId": { "type": "string", "pattern": "^REQ-(?:[0-9]{3}|[1-9][0-9]{3,})$" },
+    "termId":        { "type": "string", "pattern": "^TERM-(?:[0-9]{3}|[1-9][0-9]{3,})$" },
+    "criterionId":   { "type": "string", "pattern": "^AC-(?:[0-9]{3}|[1-9][0-9]{3,})$" },
+    "sectionOrRequirementId": {
+      "type": "string",
+      "pattern": "^(?:SEC|REQ)-(?:[0-9]{3}|[1-9][0-9]{3,})$"
+    },
+
+    "title": {
+      "description": "Human-facing name; becomes a heading. Single line, no leading or trailing whitespace.",
+      "type": "string",
+      "pattern": "^\\S(?:[^\\r\\n]*\\S)?$"
+    },
+    "markdown": {
+      "type": "string",
+      "minLength": 1,
+      "contentMediaType": "text/markdown"
+    },
+    "nonEmptySet": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "usesTerm": {
+      "description": "Terms whose definitions this node's slice pulls in.",
+      "$ref": "#/$defs/nonEmptySet",
+      "items": { "$ref": "#/$defs/termId" }
+    },
+
+    "section": {
+      "description": "Document structure and freeform prose. Has no satisfaction value.",
+      "type": "object",
+      "required": ["kind", "id", "title"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "section" },
+        "id": { "$ref": "#/$defs/sectionId" },
+        "title": { "$ref": "#/$defs/title" },
+        "body": { "$ref": "#/$defs/markdown" },
+        "usesTerm": { "$ref": "#/$defs/usesTerm" },
+        "children": {
+          "description": "Contained Sections and Requirements, in document order.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/sectionChild" }
+        }
+      }
+    },
+    "sectionChild": {
+      "oneOf": [
+        { "$ref": "#/$defs/section" },
+        { "$ref": "#/$defs/requirement" }
+      ]
+    },
+
+    "requirement": {
+      "description": "A satisfiable statement.",
+      "type": "object",
+      "required": ["kind", "id", "title", "body", "modality"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "requirement" },
+        "id": { "$ref": "#/$defs/requirementId" },
+        "title": { "$ref": "#/$defs/title" },
+        "body": {
+          "description": "Primary statement. Should contain the modality keyword; `check` warns if it does not.",
+          "$ref": "#/$defs/markdown"
+        },
+        "rationale": { "$ref": "#/$defs/markdown" },
+        "modality": { "enum": ["MUST", "MUST NOT", "SHOULD", "SHOULD NOT", "MAY"] },
+        "refinement": {
+          "description": "How the requirements that refine this one combine. Present exactly when at least one requirement refines this one.",
+          "enum": ["AND", "OR", "XOR"]
+        },
+        "refines": {
+          "description": "Requirements this one helps satisfy. Always explicit: nesting never implies refinement.",
+          "$ref": "#/$defs/nonEmptySet",
+          "items": { "$ref": "#/$defs/requirementId" }
+        },
+        "dependsOn": {
+          "description": "Requirements or Sections needed to understand or implement this one. Context only; never affects satisfaction.",
+          "$ref": "#/$defs/nonEmptySet",
+          "items": { "$ref": "#/$defs/sectionOrRequirementId" }
+        },
+        "usesTerm": { "$ref": "#/$defs/usesTerm" },
+        "acceptanceCriteria": {
+          "description": "Advisory statements of what done looks like, in order. Rendered as a block inside this requirement.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/acceptanceCriterion" }
+        },
+        "children": {
+          "description": "Contained Requirements, in document order. Containment only; a child refines this requirement only if its `refines` says so.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/requirement" }
+        }
+      }
+    },
+
+    "acceptanceCriterion": {
+      "description": "A speculative, advisory statement of what done looks like for its containing requirement. Asserts nothing.",
+      "type": "object",
+      "required": ["kind", "id", "title", "body"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "acceptanceCriterion" },
+        "id": { "$ref": "#/$defs/criterionId" },
+        "title": { "$ref": "#/$defs/title" },
+        "body": {
+          "description": "May contain a formal sketch in a code block; the engine never reads it.",
+          "$ref": "#/$defs/markdown"
+        }
+      }
+    },
+
+    "glossary": {
+      "description": "The Glossary Section. Contains every Term and nothing else.",
+      "type": "object",
+      "required": ["kind", "id", "title"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "section" },
+        "id": { "$ref": "#/$defs/sectionId" },
+        "title": { "$ref": "#/$defs/title" },
+        "body": { "$ref": "#/$defs/markdown" },
+        "terms": {
+          "description": "Serialized in ID order; rendered alphabetically by title.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/term" }
+        }
+      }
+    },
+
+    "term": {
+      "description": "A glossary entry.",
+      "type": "object",
+      "required": ["kind", "id", "title", "definition"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "term" },
+        "id": { "$ref": "#/$defs/termId" },
+        "title": { "$ref": "#/$defs/title" },
+        "aliases": {
+          "$ref": "#/$defs/nonEmptySet",
+          "items": { "$ref": "#/$defs/title" }
+        },
+        "definition": { "$ref": "#/$defs/markdown" }
+      }
+    }
+  },
+
+  "x-checkInvariants": [
+    "Every id is unique across the document.",
+    "Every ID in refines, dependsOn, and usesTerm names an existing node of the allowed kind.",
+    "refines is acyclic; dependsOn is acyclic.",
+    "refinement is present if and only if at least one requirement refines this one.",
+    "Glossary terms are serialized in ID order.",
+    "A requirement's body contains its modality keyword (warning).",
+    "An AND requirement whose refining children are all MAY is vacuously satisfied (warning)."
+  ]
+}
