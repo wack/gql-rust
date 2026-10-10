@@ -20,7 +20,8 @@
 //! Derived data (status, satisfaction) is not part of the format and is not
 //! loaded; [`apply_overlay`] attaches it as extra node properties.
 
-use crate::store::{GraphStoreMut, NodeId};
+use crate::BoxFuture;
+use crate::store::{GraphStoreMut, NodeId, StoreError};
 use crate::value::Value;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -37,6 +38,8 @@ pub enum SpecError {
         kind: &'static str,
         to: String,
     },
+    #[error("store: {0}")]
+    Store(#[from] StoreError),
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,7 +162,7 @@ fn s(v: &str) -> Value {
 }
 
 impl Loader<'_> {
-    fn node(
+    async fn node(
         &mut self,
         label: &str,
         id: &str,
@@ -170,15 +173,23 @@ impl Loader<'_> {
         }
         props.insert("id".into(), s(id));
         props.insert("spec".into(), s(&self.spec));
-        let n = self.store.add_node(vec![label.to_string()], props);
+        let n = self.store.add_node(vec![label.to_string()], props).await?;
         self.ids.insert(id.to_string(), n);
         Ok(n)
     }
 
-    fn contains(&mut self, parent: NodeId, child: NodeId, label: &str, position: usize) {
+    async fn contains(
+        &mut self,
+        parent: NodeId,
+        child: NodeId,
+        label: &str,
+        position: usize,
+    ) -> Result<(), StoreError> {
         let props = BTreeMap::from([("position".to_string(), Value::Int(position as i64))]);
         self.store
-            .add_edge(parent, child, vec![label.to_string()], props);
+            .add_edge(parent, child, vec![label.to_string()], props)
+            .await?;
+        Ok(())
     }
 
     fn refs(
@@ -194,24 +205,33 @@ impl Loader<'_> {
         }
     }
 
-    fn section(&mut self, sec: &Section) -> Result<NodeId, SpecError> {
-        let mut props = BTreeMap::from([("title".to_string(), s(&sec.title))]);
-        if let Some(b) = &sec.body {
-            props.insert("body".into(), s(b));
-        }
-        let n = self.node("Section", &sec.id, props)?;
-        self.refs(&sec.id, "USES_TERM", &sec.uses_term, &["TERM-"]);
-        for (i, child) in sec.children.iter().enumerate() {
-            let c = match child {
-                SectionChild::Section(x) => self.section(x)?,
-                SectionChild::Requirement(x) => self.requirement(x)?,
-            };
-            self.contains(n, c, "CONTAINS", i);
-        }
-        Ok(n)
+    fn section<'s>(&'s mut self, sec: &'s Section) -> BoxFuture<'s, Result<NodeId, SpecError>> {
+        Box::pin(async move {
+            let mut props = BTreeMap::from([("title".to_string(), s(&sec.title))]);
+            if let Some(b) = &sec.body {
+                props.insert("body".into(), s(b));
+            }
+            let n = self.node("Section", &sec.id, props).await?;
+            self.refs(&sec.id, "USES_TERM", &sec.uses_term, &["TERM-"]);
+            for (i, child) in sec.children.iter().enumerate() {
+                let c = match child {
+                    SectionChild::Section(x) => self.section(x).await?,
+                    SectionChild::Requirement(x) => self.requirement(x).await?,
+                };
+                self.contains(n, c, "CONTAINS", i).await?;
+            }
+            Ok(n)
+        })
     }
 
-    fn requirement(&mut self, r: &Requirement) -> Result<NodeId, SpecError> {
+    fn requirement<'s>(
+        &'s mut self,
+        r: &'s Requirement,
+    ) -> BoxFuture<'s, Result<NodeId, SpecError>> {
+        Box::pin(self.requirement_inner(r))
+    }
+
+    async fn requirement_inner(&mut self, r: &Requirement) -> Result<NodeId, SpecError> {
         let mut props = BTreeMap::from([
             ("title".to_string(), s(&r.title)),
             ("body".to_string(), s(&r.body)),
@@ -223,7 +243,7 @@ impl Loader<'_> {
         if let Some(x) = &r.refinement {
             props.insert("refinement".into(), s(x));
         }
-        let n = self.node("Requirement", &r.id, props)?;
+        let n = self.node("Requirement", &r.id, props).await?;
         self.refs(&r.id, "REFINES", &r.refines, &["REQ-"]);
         self.refs(&r.id, "DEPENDS_ON", &r.depends_on, &["REQ-", "SEC-"]);
         self.refs(&r.id, "USES_TERM", &r.uses_term, &["TERM-"]);
@@ -234,12 +254,12 @@ impl Loader<'_> {
                 ("title".to_string(), s(title)),
                 ("body".to_string(), s(body)),
             ]);
-            let c = self.node("AcceptanceCriterion", id, props)?;
-            self.contains(n, c, "HAS_CRITERION", i);
+            let c = self.node("AcceptanceCriterion", id, props).await?;
+            self.contains(n, c, "HAS_CRITERION", i).await?;
         }
         for (i, TaggedRequirement::Requirement(child)) in r.children.iter().enumerate() {
-            let c = self.requirement(child)?;
-            self.contains(n, c, "CONTAINS", i);
+            let c = self.requirement(child).await?;
+            self.contains(n, c, "CONTAINS", i).await?;
         }
         Ok(n)
     }
@@ -248,7 +268,7 @@ impl Loader<'_> {
 /// Load a v1 specification document. Structural validation is limited to
 /// what the mapping needs (known fields, unique ids, resolvable references);
 /// full schema validation and `x-checkInvariants` remain `check`'s job.
-pub fn load_spec(json: &str, store: &mut dyn GraphStoreMut) -> Result<SpecIndex, SpecError> {
+pub async fn load_spec(json: &str, store: &mut dyn GraphStoreMut) -> Result<SpecIndex, SpecError> {
     let doc: Document = serde_json::from_str(json)?;
     let mut l = Loader {
         store,
@@ -257,16 +277,16 @@ pub fn load_spec(json: &str, store: &mut dyn GraphStoreMut) -> Result<SpecIndex,
         pending: Vec::new(),
     };
     let TaggedSection::Section(root_section) = &doc.root;
-    let root = l.section(root_section)?;
+    let root = l.section(root_section).await?;
 
     let g = &doc.glossary;
     let mut props = BTreeMap::from([("title".to_string(), s(&g.title))]);
     if let Some(b) = &g.body {
         props.insert("body".into(), s(b));
     }
-    let gloss = l.node("Section", &g.id, props)?;
+    let gloss = l.node("Section", &g.id, props).await?;
     let pos = root_section.children.len();
-    l.contains(root, gloss, "CONTAINS", pos);
+    l.contains(root, gloss, "CONTAINS", pos).await?;
     for (i, t) in g.terms.iter().enumerate() {
         let mut props = BTreeMap::from([
             ("title".to_string(), s(&t.title)),
@@ -278,8 +298,8 @@ pub fn load_spec(json: &str, store: &mut dyn GraphStoreMut) -> Result<SpecIndex,
                 Value::List(t.aliases.iter().map(|a| s(a)).collect()),
             );
         }
-        let n = l.node("Term", &t.id, props)?;
-        l.contains(gloss, n, "CONTAINS", i);
+        let n = l.node("Term", &t.id, props).await?;
+        l.contains(gloss, n, "CONTAINS", i).await?;
     }
 
     for (from, label, to, kinds) in std::mem::take(&mut l.pending) {
@@ -295,7 +315,8 @@ pub fn load_spec(json: &str, store: &mut dyn GraphStoreMut) -> Result<SpecIndex,
             })?;
         let source = l.ids[&from];
         l.store
-            .add_edge(source, target, vec![label.to_string()], BTreeMap::new());
+            .add_edge(source, target, vec![label.to_string()], BTreeMap::new())
+            .await?;
     }
     Ok(l.ids)
 }
@@ -303,7 +324,7 @@ pub fn load_spec(json: &str, store: &mut dyn GraphStoreMut) -> Result<SpecIndex,
 /// Attach derived, non-normative properties (e.g. `status` from validator
 /// results) to nodes by SLCR id. Input shape: `{"REQ-001": {"status": "satisfied"}}`.
 /// Values may be JSON strings, numbers, booleans, null or arrays thereof.
-pub fn apply_overlay(
+pub async fn apply_overlay(
     json: &str,
     index: &SpecIndex,
     store: &mut dyn GraphStoreMut,
@@ -316,7 +337,7 @@ pub fn apply_overlay(
             to: id.clone(),
         })?;
         for (k, v) in props {
-            store.set_node_property(node, &k, from_json(&v));
+            store.set_node_property(node, &k, from_json(&v)).await?;
         }
     }
     Ok(())

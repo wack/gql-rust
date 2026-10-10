@@ -1,11 +1,12 @@
 //! Profile-level behaviour on an SLCR-shaped specification graph.
 
+use pollster::block_on;
 use slcr_gql::{Error, Params, PetgraphStore, Value, load_fixture, query};
 
 /// Sections contain requirements (a tree); requirements refine one another (a DAG).
 fn spec() -> PetgraphStore {
     let mut g = PetgraphStore::new();
-    load_fixture(
+    block_on(load_fixture(
         &mut g,
         "
         INSERT (models:Section {title: 'Models'}),
@@ -18,13 +19,13 @@ fn spec() -> PetgraphStore {
                (r2)-[:CONTAINS]->(r3), (models)-[:CONTAINS]->(r4)
         INSERT (r2)-[:REFINES]->(r1), (r3)-[:REFINES]->(r2), (r4)-[:REFINES]->(r1)
         ",
-    )
+    ))
     .unwrap();
     g
 }
 
 fn strings(g: &PetgraphStore, q: &str) -> Vec<Vec<String>> {
-    query(g, q, &Params::new())
+    block_on(query(g, q, &Params::new()))
         .unwrap_or_else(|e| panic!("{q}: {e}"))
         .rows
         .iter()
@@ -90,11 +91,11 @@ fn parameters_offset_limit() {
     let g = spec();
     let mut p = Params::new();
     p.insert("m".into(), Value::String("MUST".into()));
-    let r = query(
+    let r = block_on(query(
         &g,
         "MATCH (r:Requirement) WHERE r.modality = $m RETURN r.id ORDER BY r.id OFFSET 1 LIMIT 1",
         &p,
-    )
+    ))
     .unwrap();
     assert_eq!(r.rows, vec![vec![Value::String("REQ-2".into())]]);
 }
@@ -102,10 +103,10 @@ fn parameters_offset_limit() {
 #[test]
 fn unbounded_quantifier_terminates_on_cycles() {
     let mut g = PetgraphStore::new();
-    load_fixture(
+    block_on(load_fixture(
         &mut g,
         "INSERT (a {n: 1})-[:R]->(b {n: 2})-[:R]->(c {n: 3})-[:R]->(a)",
-    )
+    ))
     .unwrap();
     // Edges are bound at most once per MATCH, so every walk is finite.
     let rows = strings(&g, "MATCH ({n: 1})-[:R]->{1,}(x) RETURN x.n ORDER BY x.n");
@@ -116,9 +117,9 @@ fn unbounded_quantifier_terminates_on_cycles() {
 fn unordered_results_are_deterministic() {
     let g = spec();
     let q = "MATCH (s)-[:CONTAINS]->(c) RETURN s, c";
-    let first = query(&g, q, &Params::new()).unwrap();
+    let first = block_on(query(&g, q, &Params::new())).unwrap();
     for _ in 0..10 {
-        assert_eq!(query(&g, q, &Params::new()).unwrap(), first);
+        assert_eq!(block_on(query(&g, q, &Params::new())).unwrap(), first);
     }
 }
 
@@ -133,7 +134,7 @@ fn out_of_profile_is_rejected_loudly() {
         ("RETURN toString(1)", "function toString()"),
         ("MATCH (n) SET n.x = 1 RETURN n", "SET"),
     ] {
-        match query(&g, q, &Params::new()) {
+        match block_on(query(&g, q, &Params::new())) {
             Err(Error::Unsupported { feature: f, .. }) => assert_eq!(f, feature, "{q}"),
             other => panic!("{q}: expected Unsupported({feature}), got {other:?}"),
         }
@@ -152,7 +153,10 @@ fn semantic_errors() {
         "MATCH (n) RETURN n.id AS a ORDER BY $missing",
     ] {
         assert!(
-            matches!(query(&g, q, &Params::new()), Err(Error::Semantic(_))),
+            matches!(
+                block_on(query(&g, q, &Params::new())),
+                Err(Error::Semantic(_))
+            ),
             "{q} should be a semantic error"
         );
     }
@@ -166,7 +170,16 @@ fn gql_concatenation_not_plus() {
         vec![vec!["'ab'", "[1, 2]"]]
     );
     assert!(matches!(
-        query(&g, "RETURN 'a' + 'b'", &Params::new()),
+        block_on(query(&g, "RETURN 'a' + 'b'", &Params::new())),
         Err(Error::Data(_))
     ));
+}
+
+#[test]
+fn query_futures_are_send() {
+    fn assert_send<T: Send>(_: &T) {}
+    let mut g = spec();
+    let p = Params::new();
+    assert_send(&load_fixture(&mut g, "INSERT (:X)"));
+    assert_send(&query(&g, "MATCH (n)-->{1,}(m) RETURN count(*)", &p));
 }

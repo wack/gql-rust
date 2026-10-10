@@ -77,7 +77,11 @@ fn type_err(name: &str, v: &Value) -> Error {
     Error::Data(format!("{name}() does not accept {}", v.type_name()))
 }
 
-pub fn call_scalar(name: &str, args: Vec<Value>, store: &dyn GraphStore) -> Result<Value, Error> {
+pub async fn call_scalar(
+    name: &str,
+    args: Vec<Value>,
+    store: &dyn GraphStore,
+) -> Result<Value, Error> {
     if name == "coalesce" {
         return Ok(args
             .into_iter()
@@ -121,12 +125,14 @@ pub fn call_scalar(name: &str, args: Vec<Value>, store: &dyn GraphStore) -> Resu
         ("labels", Value::Node(n)) => Value::List(
             store
                 .node_labels(*n)
+                .await?
                 .into_iter()
                 .map(Value::String)
                 .collect(),
         ),
         ("type", Value::Edge(e)) => store
             .edge_labels(*e)
+            .await?
             .into_iter()
             .next()
             .map(Value::String)

@@ -1,6 +1,7 @@
 //! TCK result-value notation: parsing expected cells and converting actual
 //! engine values into the same shape for comparison.
 
+use pollster::block_on;
 use slcr_gql::{GraphStore, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -108,17 +109,21 @@ pub fn from_value(v: &Value, g: &dyn GraphStore) -> TV {
                 .collect(),
         ),
         Value::Node(n) => TV::Node {
-            labels: g.node_labels(*n).into_iter().collect(),
-            props: g
-                .node_properties(*n)
+            labels: block_on(g.node_labels(*n)).unwrap().into_iter().collect(),
+            props: block_on(g.node_properties(*n))
+                .unwrap()
                 .iter()
                 .map(|(k, x)| (k.clone(), from_value(x, g)))
                 .collect(),
         },
         Value::Edge(e) => TV::Rel {
-            label: g.edge_labels(*e).into_iter().next().unwrap_or_default(),
-            props: g
-                .edge_properties(*e)
+            label: block_on(g.edge_labels(*e))
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap_or_default(),
+            props: block_on(g.edge_properties(*e))
+                .unwrap()
                 .iter()
                 .map(|(k, x)| (k.clone(), from_value(x, g)))
                 .collect(),

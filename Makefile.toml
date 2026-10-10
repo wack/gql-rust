@@ -44,6 +44,15 @@ workspace = false
 command = "cargo"
 args = ["clippy", "--all-targets", "--workspace", "--locked", "--features", "grafeo", "--", "-D", "warnings"]
 
+# Same again for the Turso backend (src/store/turso_store.rs), which lives
+# behind the `turso` Cargo feature, off by default.
+[tasks.clippy-turso]
+description = "Canonical clippy command for the turso feature."
+category = "Development"
+workspace = false
+command = "cargo"
+args = ["clippy", "--all-targets", "--workspace", "--locked", "--features", "turso", "--", "-D", "warnings"]
+
 [tasks.ci-flow]
 dependencies = [
   "pre-ci-flow",
@@ -116,6 +125,29 @@ args = [
 # parallel CI job instead of serializing after build/docs/coverage.
 [tasks.ci-grafeo-flow]
 dependencies = ["clippy-grafeo", "test-grafeo"]
+
+# Same suite with the `turso` feature, which adds tests/turso.rs (Turso vs
+# the reference backend, persistence) and runs the TCK gate against an
+# in-memory TursoStore (TCK_STORE=turso) instead of PetgraphStore. The
+# default-feature `test` task already covers the TCK on PetgraphStore.
+[tasks.test-turso]
+workspace = false
+description = "Run our test suite with the turso feature, with the TCK on TursoStore"
+env = { TCK_STORE = "turso" }
+command = "cargo"
+args = [
+  "test",
+  "--locked",
+  "--features",
+  "turso",
+  "@@remove-empty(CARGO_MAKE_CARGO_VERBOSE_FLAGS)",
+  "@@split(CARGO_MAKE_CARGO_BUILD_TEST_FLAGS, )",
+]
+
+# Bundles clippy-turso + test-turso for CI's turso job (see on-merge.yml),
+# kept out of `ci-flow` for the same reason as ci-grafeo-flow.
+[tasks.ci-turso-flow]
+dependencies = ["clippy-turso", "test-turso"]
 
 [tasks.fmt]
 alias = "format"

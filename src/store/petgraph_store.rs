@@ -1,4 +1,7 @@
-use super::{EdgeId, EdgeRef, GraphStore, GraphStoreMut, Incidence, NodeId};
+use super::{
+    EdgeId, EdgeRef, GraphStore, GraphStoreMut, Incidence, NodeId, StoreError, StoreErrorKind,
+    StoreResult, async_trait,
+};
 use crate::value::Value;
 use petgraph::Direction;
 use petgraph::stable_graph::{EdgeIndex, NodeIndex, StableDiGraph};
@@ -52,33 +55,52 @@ impl PetgraphStore {
     fn e(id: EdgeId) -> EdgeIndex {
         EdgeIndex::new(id.0 as usize)
     }
+
+    fn node(&self, id: NodeId) -> StoreResult<&Element> {
+        self.graph
+            .node_weight(Self::n(id))
+            .ok_or_else(|| not_found("node", id.0))
+    }
+
+    fn edge_element(&self, id: EdgeId) -> StoreResult<&Element> {
+        self.graph
+            .edge_weight(Self::e(id))
+            .ok_or_else(|| not_found("edge", id.0))
+    }
 }
 
+#[async_trait]
 impl GraphStore for PetgraphStore {
-    fn nodes(&self) -> Box<dyn Iterator<Item = NodeId> + '_> {
-        Box::new(self.graph.node_indices().map(|i| NodeId(i.index() as u64)))
+    async fn nodes(&self) -> StoreResult<Vec<NodeId>> {
+        Ok(self
+            .graph
+            .node_indices()
+            .map(|i| NodeId(i.index() as u64))
+            .collect())
     }
 
-    fn node_labels(&self, node: NodeId) -> Vec<String> {
-        self.graph[Self::n(node)].labels.clone()
+    async fn node_labels(&self, node: NodeId) -> StoreResult<Vec<String>> {
+        Ok(self.node(node)?.labels.clone())
     }
 
-    fn node_has_label(&self, node: NodeId, label: &str) -> bool {
-        self.graph[Self::n(node)]
+    async fn node_has_label(&self, node: NodeId, label: &str) -> StoreResult<bool> {
+        Ok(self
+            .node(node)?
             .labels
             .binary_search_by(|l| l.as_str().cmp(label))
-            .is_ok()
+            .is_ok())
     }
 
-    fn node_property(&self, node: NodeId, key: &str) -> Option<Value> {
-        self.graph[Self::n(node)].props.get(key).cloned()
+    async fn node_property(&self, node: NodeId, key: &str) -> StoreResult<Option<Value>> {
+        Ok(self.node(node)?.props.get(key).cloned())
     }
 
-    fn node_properties(&self, node: NodeId) -> BTreeMap<String, Value> {
-        self.graph[Self::n(node)].props.clone()
+    async fn node_properties(&self, node: NodeId) -> StoreResult<BTreeMap<String, Value>> {
+        Ok(self.node(node)?.props.clone())
     }
 
-    fn edges(&self, node: NodeId, incidence: Incidence) -> Box<dyn Iterator<Item = EdgeRef> + '_> {
+    async fn edges(&self, node: NodeId, incidence: Incidence) -> StoreResult<Vec<EdgeRef>> {
+        self.node(node)?;
         let dir = match incidence {
             Incidence::Outgoing => Direction::Outgoing,
             Incidence::Incoming => Direction::Incoming,
@@ -94,60 +116,83 @@ impl GraphStore for PetgraphStore {
             })
             .collect();
         v.sort_by_key(|e| e.id);
-        Box::new(v.into_iter())
+        Ok(v)
     }
 
-    fn edge(&self, edge: EdgeId) -> EdgeRef {
+    async fn edge(&self, edge: EdgeId) -> StoreResult<EdgeRef> {
         let (s, t) = self
             .graph
             .edge_endpoints(Self::e(edge))
-            .expect("dangling edge id");
-        EdgeRef {
+            .ok_or_else(|| not_found("edge", edge.0))?;
+        Ok(EdgeRef {
             id: edge,
             source: NodeId(s.index() as u64),
             target: NodeId(t.index() as u64),
-        }
+        })
     }
 
-    fn edge_labels(&self, edge: EdgeId) -> Vec<String> {
-        self.graph[Self::e(edge)].labels.clone()
+    async fn edge_labels(&self, edge: EdgeId) -> StoreResult<Vec<String>> {
+        Ok(self.edge_element(edge)?.labels.clone())
     }
 
-    fn edge_property(&self, edge: EdgeId, key: &str) -> Option<Value> {
-        self.graph[Self::e(edge)].props.get(key).cloned()
+    async fn edge_property(&self, edge: EdgeId, key: &str) -> StoreResult<Option<Value>> {
+        Ok(self.edge_element(edge)?.props.get(key).cloned())
     }
 
-    fn edge_properties(&self, edge: EdgeId) -> BTreeMap<String, Value> {
-        self.graph[Self::e(edge)].props.clone()
+    async fn edge_properties(&self, edge: EdgeId) -> StoreResult<BTreeMap<String, Value>> {
+        Ok(self.edge_element(edge)?.props.clone())
     }
 }
 
+#[async_trait]
 impl GraphStoreMut for PetgraphStore {
-    fn add_node(&mut self, labels: Vec<String>, props: BTreeMap<String, Value>) -> NodeId {
-        NodeId(self.graph.add_node(Element::new(labels, props)).index() as u64)
+    async fn add_node(
+        &mut self,
+        labels: Vec<String>,
+        props: BTreeMap<String, Value>,
+    ) -> StoreResult<NodeId> {
+        Ok(NodeId(
+            self.graph.add_node(Element::new(labels, props)).index() as u64,
+        ))
     }
 
-    fn add_edge(
+    async fn add_edge(
         &mut self,
         source: NodeId,
         target: NodeId,
         labels: Vec<String>,
         props: BTreeMap<String, Value>,
-    ) -> EdgeId {
+    ) -> StoreResult<EdgeId> {
+        self.node(source)?;
+        self.node(target)?;
         let idx = self.graph.add_edge(
             Self::n(source),
             Self::n(target),
             Element::new(labels, props),
         );
-        EdgeId(idx.index() as u64)
+        Ok(EdgeId(idx.index() as u64))
     }
 
-    fn set_node_property(&mut self, node: NodeId, key: &str, value: Value) {
-        let props = &mut self.graph[Self::n(node)].props;
+    async fn set_node_property(
+        &mut self,
+        node: NodeId,
+        key: &str,
+        value: Value,
+    ) -> StoreResult<()> {
+        let props = &mut self
+            .graph
+            .node_weight_mut(Self::n(node))
+            .ok_or_else(|| not_found("node", node.0))?
+            .props;
         if value.is_null() {
             props.remove(key);
         } else {
             props.insert(key.to_string(), value);
         }
+        Ok(())
     }
+}
+
+fn not_found(what: &str, id: u64) -> StoreError {
+    StoreError::new(StoreErrorKind::NotFound, format!("no {what} with id {id}"))
 }

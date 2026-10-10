@@ -23,6 +23,7 @@ jobs:
       - "format"
       - "build"
       - "grafeo"
+      - "turso"
     steps:
       - if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
         run: |
@@ -80,3 +81,19 @@ jobs:
           shared-key: rust-ci-grafeo
       - name: Cargo Make
         run: cargo make ci-grafeo-flow
+
+  # Validates the `turso` feature: clippy plus the full test suite with the
+  # feature on, which adds tests/turso.rs and runs the TCK gate against the
+  # Turso backend (TCK_STORE=turso, set by the test-turso task).
+  turso:
+    name: Validate Turso Feature
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Setup Rust
+        uses: "wack/gh-actions/setup-rust@trunk"
+        with:
+          shared-key: rust-ci-turso
+      - name: Cargo Make
+        run: cargo make ci-turso-flow
