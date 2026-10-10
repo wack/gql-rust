@@ -101,27 +101,28 @@ fn props_literal(props: &std::collections::BTreeMap<String, Value>, extra: Optio
 fn mirror(g: &PetgraphStore) -> GrafeoDB {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
-    for n in block_on(g.nodes()) {
+    for n in block_on(g.nodes()).unwrap() {
         let labels: String = block_on(g.node_labels(n))
+            .unwrap()
             .iter()
             .map(|l| format!(":{l}"))
             .collect();
         let stmt = format!(
             "INSERT ({labels} {})",
-            props_literal(&block_on(g.node_properties(n)), Some(n.0))
+            props_literal(&block_on(g.node_properties(n)).unwrap(), Some(n.0))
         );
         session
             .execute(&stmt)
             .unwrap_or_else(|e| panic!("{stmt}: {e}"));
     }
-    for n in block_on(g.nodes()) {
-        for e in block_on(g.edges(n, slcr_gql::store::Incidence::Outgoing)) {
-            let label = block_on(g.edge_labels(e.id)).join("");
+    for n in block_on(g.nodes()).unwrap() {
+        for e in block_on(g.edges(n, slcr_gql::store::Incidence::Outgoing)).unwrap() {
+            let label = block_on(g.edge_labels(e.id)).unwrap().join("");
             let stmt = format!(
                 "MATCH (a {{`_oracle`: {}}}), (b {{`_oracle`: {}}}) INSERT (a)-[:{label} {}]->(b)",
                 e.source.0,
                 e.target.0,
-                props_literal(&block_on(g.edge_properties(e.id)), None)
+                props_literal(&block_on(g.edge_properties(e.id)).unwrap(), None)
             );
             session
                 .execute(&stmt)

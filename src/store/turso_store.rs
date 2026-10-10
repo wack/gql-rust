@@ -34,14 +34,17 @@
 //! store, is a `NULL` value of float kind), strings are text, and lists and
 //! maps are blobs in a private binary encoding. `kind` disambiguates.
 
-use super::{EdgeId, EdgeRef, GraphStore, GraphStoreMut, Incidence, NodeId, async_trait};
+use super::{
+    EdgeId, EdgeRef, GraphStore, GraphStoreMut, Incidence, NodeId, StoreError, StoreErrorKind,
+    StoreResult, async_trait,
+};
 use crate::value::Value;
 use async_lock::Mutex;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use turso::{Builder, Connection, Database, IntoParams, Row};
 
 const SCHEMA_VERSION: i64 = 1;
@@ -161,20 +164,22 @@ impl FromStr for TursoLocation {
 /// # pollster::block_on(async {
 /// let mut g = TursoStore::open(":memory:").await?;
 /// g.transaction(async |g| load_fixture(g, "INSERT (:Requirement {id: 'REQ-1'})").await)
-///     .await??;
+///     .await?;
 /// let r = query(&g, "MATCH (r:Requirement) RETURN r.id", &Params::new()).await?;
 /// assert_eq!(r.rows[0][0].to_string(), "'REQ-1'");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// # }).unwrap();
 /// ```
 ///
-/// # Panics
+/// # Errors
 ///
-/// [`GraphStore`] and [`GraphStoreMut`] are infallible, so their methods panic
-/// if the database fails (an I/O error, a corrupt file, or another writer
-/// holding the lock), and on ids that do not belong to this store, as
-/// [`PetgraphStore`](super::PetgraphStore) does. Opening the store and
-/// [`transaction`](Self::transaction) report errors instead.
+/// Database failures surface as [`StoreError`]s: a busy or locked database,
+/// an interrupted statement or an I/O failure as
+/// [`Unavailable`](StoreErrorKind::Unavailable), a corrupt file or
+/// undecodable value as [`Corrupt`](StoreErrorKind::Corrupt), and a mutation
+/// that references an unknown node or edge as
+/// [`NotFound`](StoreErrorKind::NotFound). Reads of an unknown id return
+/// nothing rather than an error, except [`edge`](GraphStore::edge).
 ///
 /// Mutations outside [`transaction`](Self::transaction) commit one element
 /// at a time, which costs a disk sync per element for a file database; load
@@ -186,10 +191,11 @@ pub struct TursoStore {
     conn: Mutex<Connection>,
     _db: Database,
     location: TursoLocation,
-    /// Set when a transaction is abandoned unfinished, because its future
-    /// was dropped or panicked. `Drop` cannot run async SQL, so the next
-    /// operation on the store rolls it back.
-    abandoned: Arc<AtomicBool>,
+    /// What to roll back because a transaction or a mutation's savepoint
+    /// was abandoned unfinished: its future was dropped or panicked, or its
+    /// COMMIT or ROLLBACK failed. `Drop` cannot run async SQL, so the next
+    /// operation does it. One of the `ABANDONED_*` levels.
+    abandoned: Arc<AtomicU8>,
 }
 
 impl std::fmt::Debug for TursoStore {
@@ -229,7 +235,7 @@ impl TursoStore {
             conn: Mutex::new(conn),
             _db: db,
             location,
-            abandoned: Arc::new(AtomicBool::new(false)),
+            abandoned: Arc::new(AtomicU8::new(ABANDONED_NONE)),
         };
         store.init_schema().await?;
         Ok(store)
@@ -247,50 +253,57 @@ impl TursoStore {
         }
     }
 
-    pub async fn node_count(&self) -> usize {
+    pub async fn node_count(&self) -> StoreResult<usize> {
         self.count("SELECT count(*) FROM gql_nodes").await
     }
 
-    pub async fn edge_count(&self) -> usize {
+    pub async fn edge_count(&self) -> StoreResult<usize> {
         self.count("SELECT count(*) FROM gql_edges").await
     }
 
     /// Run `f` in one transaction: it commits if `f` returns `Ok` and rolls
-    /// back if `f` returns `Err`, panics, or is dropped before finishing. The
-    /// outer error reports a failure to begin or commit; the inner result is
-    /// `f`'s.
+    /// back if `f` returns `Err`, panics, or is dropped before finishing.
+    /// Failing to begin or commit is reported as `f`'s error type, which
+    /// must accept a [`StoreError`]; the crate's [`Error`](crate::Error) and
+    /// [`SpecError`](crate::SpecError) both do.
     ///
     /// ```
     /// # use slcr_gql::{TursoStore, load_spec};
     /// # let src = include_str!("../../tests/data/todo-api.spec.json");
     /// # pollster::block_on(async {
     /// let mut g = TursoStore::in_memory().await?;
-    /// let index = g.transaction(async |g| load_spec(src, g).await).await??;
+    /// let index = g.transaction(async |g| load_spec(src, g).await).await?;
     /// assert!(index.get("REQ-001").is_some());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # }).unwrap();
     /// ```
-    pub async fn transaction<T, E>(
+    pub async fn transaction<T, E: From<StoreError>>(
         &mut self,
         f: impl AsyncFnOnce(&mut Self) -> Result<T, E>,
-    ) -> Result<Result<T, E>, TursoStoreError> {
+    ) -> Result<T, E> {
         {
             let conn = self.conn.lock().await;
             settle(&conn, &self.abandoned).await?;
-            conn.execute("BEGIN", ()).await?;
+            conn.execute("BEGIN", ()).await.map_err(store_error)?;
         }
-        let mut guard = Abandon::arm(&self.abandoned);
+        let mut guard = Abandon::arm(&self.abandoned, ABANDONED_TRANSACTION);
         let out = f(self).await;
         let conn = self.conn.lock().await;
-        let finished = match out {
-            Ok(v) => conn.execute("COMMIT", ()).await.map(|_| Ok(v)),
-            Err(e) => conn.execute("ROLLBACK", ()).await.map(|_| Err(e)),
-        };
-        // On error the guard stays armed: if the transaction is still open,
-        // the next operation rolls it back.
-        let out = finished?;
-        guard.disarm();
-        Ok(out)
+        // On a failed COMMIT or ROLLBACK the guard stays armed: if the
+        // transaction is still open, the next operation rolls it back.
+        match out {
+            Ok(v) => {
+                conn.execute("COMMIT", ()).await.map_err(store_error)?;
+                guard.disarm();
+                Ok(v)
+            }
+            Err(e) => {
+                if conn.execute("ROLLBACK", ()).await.is_ok() {
+                    guard.disarm();
+                }
+                Err(e)
+            }
+        }
     }
 
     async fn init_schema(&self) -> Result<(), TursoStoreError> {
@@ -342,10 +355,10 @@ impl TursoStore {
         }
     }
 
-    async fn rows(&self, sql: &str, params: impl IntoParams + Send) -> Vec<Row> {
+    async fn rows(&self, sql: &str, params: impl IntoParams + Send) -> StoreResult<Vec<Row>> {
+        let conn = self.conn.lock().await;
+        settle(&conn, &self.abandoned).await?;
         let res: turso::Result<Vec<Row>> = async {
-            let conn = self.conn.lock().await;
-            settle(&conn, &self.abandoned).await?;
             let mut stmt = conn.prepare_cached(sql).await?;
             let mut rows = stmt.query(params).await?;
             let mut out = Vec::new();
@@ -355,92 +368,111 @@ impl TursoStore {
             Ok(out)
         }
         .await;
-        res.unwrap_or_else(|e| panic!("turso store: `{sql}`: {e}"))
+        res.map_err(store_error)
     }
 
-    async fn exec(&self, sql: &str, params: impl IntoParams + Send) {
-        self.insert(sql, params).await;
+    async fn exec(&self, sql: &str, params: impl IntoParams + Send) -> StoreResult<()> {
+        self.insert(sql, params).await.map(|_| ())
     }
 
     /// Execute `sql`, returning the rowid it inserted, if any.
-    async fn insert(&self, sql: &str, params: impl IntoParams + Send) -> i64 {
+    async fn insert(&self, sql: &str, params: impl IntoParams + Send) -> StoreResult<i64> {
+        let conn = self.conn.lock().await;
+        settle(&conn, &self.abandoned).await?;
         let res: turso::Result<i64> = async {
-            let conn = self.conn.lock().await;
-            settle(&conn, &self.abandoned).await?;
             let mut stmt = conn.prepare_cached(sql).await?;
             stmt.execute(params).await?;
             Ok(conn.last_insert_rowid())
         }
         .await;
-        res.unwrap_or_else(|e| panic!("turso store: `{sql}`: {e}"))
+        res.map_err(store_error)
     }
 
-    async fn count(&self, sql: &str) -> usize {
-        let rows = self.rows(sql, ()).await;
-        int(&rows[0], 0) as usize
+    async fn count(&self, sql: &str) -> StoreResult<usize> {
+        let rows = self.rows(sql, ()).await?;
+        let row = rows
+            .first()
+            .ok_or_else(|| corrupt("count returned no row"))?;
+        Ok(int(row, 0)? as usize)
     }
 
-    async fn ids(&self, sql: &str, params: impl IntoParams + Send) -> Vec<u64> {
+    async fn ids(&self, sql: &str, params: impl IntoParams + Send) -> StoreResult<Vec<u64>> {
         self.rows(sql, params)
-            .await
+            .await?
             .iter()
-            .map(|r| int(r, 0) as u64)
+            .map(|r| int(r, 0).map(|n| n as u64))
             .collect()
     }
 
-    async fn strings(&self, sql: &str, params: impl IntoParams + Send) -> Vec<String> {
+    async fn strings(&self, sql: &str, params: impl IntoParams + Send) -> StoreResult<Vec<String>> {
         self.rows(sql, params)
-            .await
+            .await?
             .iter()
-            .map(|r| match r.get_value(0) {
-                Ok(turso::Value::Text(s)) => s,
-                other => panic!("turso store: expected text, found {other:?}"),
-            })
+            .map(|r| text(r, 0))
             .collect()
     }
 
-    async fn property(&self, sql: &str, id: u64, key: &str) -> Option<Value> {
+    async fn exists(&self, sql: &str, params: impl IntoParams + Send) -> StoreResult<bool> {
+        Ok(!self.rows(sql, params).await?.is_empty())
+    }
+
+    async fn property(&self, sql: &str, id: u64, key: &str) -> StoreResult<Option<Value>> {
         self.rows(sql, (id as i64, key))
-            .await
+            .await?
             .first()
             .map(|r| decode_property(r, 0))
+            .transpose()
     }
 
-    async fn properties(&self, sql: &str, id: u64) -> BTreeMap<String, Value> {
+    async fn properties(&self, sql: &str, id: u64) -> StoreResult<BTreeMap<String, Value>> {
         self.rows(sql, (id as i64,))
-            .await
+            .await?
             .iter()
-            .map(|r| match r.get_value(0) {
-                Ok(turso::Value::Text(k)) => (k, decode_property(r, 1)),
-                other => panic!("turso store: expected text, found {other:?}"),
-            })
+            .map(|r| Ok((text(r, 0)?, decode_property(r, 1)?)))
             .collect()
     }
 
-    /// Begin a transaction for one mutation, unless the caller's transaction
-    /// is already open. Pass the result to [`Self::end_own`].
-    async fn begin_own(&self) -> Option<Abandon> {
-        let res: turso::Result<bool> = async {
+    /// Run one mutation atomically: in a transaction of its own, or, inside
+    /// the caller's transaction, in a savepoint. Either commits if `f`
+    /// succeeds and is undone if it fails.
+    async fn atomically<T>(&self, f: impl AsyncFnOnce() -> StoreResult<T>) -> StoreResult<T> {
+        let (level, begin, commit, undo): (_, _, _, &[&str]) = {
             let conn = self.conn.lock().await;
             settle(&conn, &self.abandoned).await?;
-            if !conn.is_autocommit()? {
-                return Ok(false);
+            if conn.is_autocommit().map_err(store_error)? {
+                (ABANDONED_TRANSACTION, "BEGIN", "COMMIT", &["ROLLBACK"])
+            } else {
+                (
+                    ABANDONED_SAVEPOINT,
+                    "SAVEPOINT gql_mutation",
+                    "RELEASE gql_mutation",
+                    &["ROLLBACK TO gql_mutation", "RELEASE gql_mutation"],
+                )
             }
-            conn.execute("BEGIN", ()).await?;
-            Ok(true)
+        };
+        self.exec(begin, ()).await?;
+        let mut guard = Abandon::arm(&self.abandoned, level);
+        let out = f().await;
+        let conn = self.conn.lock().await;
+        let ends: &[&str] = if out.is_ok() { &[commit] } else { undo };
+        let mut ended = Ok(());
+        for sql in ends {
+            ended = conn
+                .execute(*sql, ())
+                .await
+                .map(|_| ())
+                .map_err(store_error);
+            if ended.is_err() {
+                break;
+            }
         }
-        .await;
-        let began = res.unwrap_or_else(|e| panic!("turso store: BEGIN: {e}"));
-        began.then(|| Abandon::arm(&self.abandoned))
-    }
-
-    async fn end_own(&self, own: Option<Abandon>) {
-        if let Some(mut guard) = own {
-            // Armed through COMMIT: if it fails, the transaction must not
-            // stay open and swallow every later write.
-            self.exec("COMMIT", ()).await;
+        // If ending fails, the armed guard undoes the mutation later.
+        if ended.is_ok() {
             guard.disarm();
         }
+        let v = out?;
+        ended?;
+        Ok(v)
     }
 
     async fn insert_element(
@@ -449,13 +481,13 @@ impl TursoStore {
         id: i64,
         labels: Vec<String>,
         props: BTreeMap<String, Value>,
-    ) {
+    ) -> StoreResult<()> {
         for label in labels {
             self.exec(
                 &format!("INSERT OR IGNORE INTO gql_{table}_labels VALUES (?1, ?2)"),
                 (id, label),
             )
-            .await;
+            .await?;
         }
         for (key, value) in props {
             if let Some((kind, value)) = encode_property(&value) {
@@ -463,30 +495,31 @@ impl TursoStore {
                     &format!("INSERT INTO gql_{table}_props VALUES (?1, ?2, ?3, ?4)"),
                     (id, key, kind, value),
                 )
-                .await;
+                .await?;
             }
         }
+        Ok(())
     }
 }
 
 #[async_trait]
 impl GraphStore for TursoStore {
-    async fn nodes(&self) -> Vec<NodeId> {
-        let ids = self.ids("SELECT id FROM gql_nodes ORDER BY id", ()).await;
-        ids.into_iter().map(NodeId).collect()
+    async fn nodes(&self) -> StoreResult<Vec<NodeId>> {
+        let ids = self.ids("SELECT id FROM gql_nodes ORDER BY id", ()).await?;
+        Ok(ids.into_iter().map(NodeId).collect())
     }
 
-    async fn nodes_with_label(&self, label: &str) -> Vec<NodeId> {
+    async fn nodes_with_label(&self, label: &str) -> StoreResult<Vec<NodeId>> {
         let ids = self
             .ids(
                 "SELECT node FROM gql_node_labels WHERE label = ?1 ORDER BY node",
                 (label,),
             )
-            .await;
-        ids.into_iter().map(NodeId).collect()
+            .await?;
+        Ok(ids.into_iter().map(NodeId).collect())
     }
 
-    async fn node_labels(&self, node: NodeId) -> Vec<String> {
+    async fn node_labels(&self, node: NodeId) -> StoreResult<Vec<String>> {
         self.strings(
             "SELECT label FROM gql_node_labels WHERE node = ?1 ORDER BY label",
             (node.0 as i64,),
@@ -494,17 +527,15 @@ impl GraphStore for TursoStore {
         .await
     }
 
-    async fn node_has_label(&self, node: NodeId, label: &str) -> bool {
-        !self
-            .rows(
-                "SELECT 1 FROM gql_node_labels WHERE node = ?1 AND label = ?2",
-                (node.0 as i64, label),
-            )
-            .await
-            .is_empty()
+    async fn node_has_label(&self, node: NodeId, label: &str) -> StoreResult<bool> {
+        self.exists(
+            "SELECT 1 FROM gql_node_labels WHERE node = ?1 AND label = ?2",
+            (node.0 as i64, label),
+        )
+        .await
     }
 
-    async fn node_property(&self, node: NodeId, key: &str) -> Option<Value> {
+    async fn node_property(&self, node: NodeId, key: &str) -> StoreResult<Option<Value>> {
         self.property(
             "SELECT kind, value FROM gql_node_props WHERE node = ?1 AND key = ?2",
             node.0,
@@ -513,7 +544,7 @@ impl GraphStore for TursoStore {
         .await
     }
 
-    async fn node_properties(&self, node: NodeId) -> BTreeMap<String, Value> {
+    async fn node_properties(&self, node: NodeId) -> StoreResult<BTreeMap<String, Value>> {
         self.properties(
             "SELECT key, kind, value FROM gql_node_props WHERE node = ?1",
             node.0,
@@ -521,7 +552,7 @@ impl GraphStore for TursoStore {
         .await
     }
 
-    async fn edges(&self, node: NodeId, incidence: Incidence) -> Vec<EdgeRef> {
+    async fn edges(&self, node: NodeId, incidence: Incidence) -> StoreResult<Vec<EdgeRef>> {
         let sql = match incidence {
             Incidence::Outgoing => {
                 "SELECT id, source, target FROM gql_edges WHERE source = ?1 ORDER BY id"
@@ -531,23 +562,29 @@ impl GraphStore for TursoStore {
             }
         };
         self.rows(sql, (node.0 as i64,))
-            .await
+            .await?
             .iter()
             .map(edge_ref)
             .collect()
     }
 
-    async fn edge(&self, edge: EdgeId) -> EdgeRef {
+    async fn edge(&self, edge: EdgeId) -> StoreResult<EdgeRef> {
         let rows = self
             .rows(
                 "SELECT id, source, target FROM gql_edges WHERE id = ?1",
                 (edge.0 as i64,),
             )
-            .await;
-        edge_ref(rows.first().expect("dangling edge id"))
+            .await?;
+        let row = rows.first().ok_or_else(|| {
+            StoreError::new(
+                StoreErrorKind::NotFound,
+                format!("no edge with id {}", edge.0),
+            )
+        })?;
+        edge_ref(row)
     }
 
-    async fn edge_labels(&self, edge: EdgeId) -> Vec<String> {
+    async fn edge_labels(&self, edge: EdgeId) -> StoreResult<Vec<String>> {
         self.strings(
             "SELECT label FROM gql_edge_labels WHERE edge = ?1 ORDER BY label",
             (edge.0 as i64,),
@@ -555,17 +592,15 @@ impl GraphStore for TursoStore {
         .await
     }
 
-    async fn edge_has_label(&self, edge: EdgeId, label: &str) -> bool {
-        !self
-            .rows(
-                "SELECT 1 FROM gql_edge_labels WHERE edge = ?1 AND label = ?2",
-                (edge.0 as i64, label),
-            )
-            .await
-            .is_empty()
+    async fn edge_has_label(&self, edge: EdgeId, label: &str) -> StoreResult<bool> {
+        self.exists(
+            "SELECT 1 FROM gql_edge_labels WHERE edge = ?1 AND label = ?2",
+            (edge.0 as i64, label),
+        )
+        .await
     }
 
-    async fn edge_property(&self, edge: EdgeId, key: &str) -> Option<Value> {
+    async fn edge_property(&self, edge: EdgeId, key: &str) -> StoreResult<Option<Value>> {
         self.property(
             "SELECT kind, value FROM gql_edge_props WHERE edge = ?1 AND key = ?2",
             edge.0,
@@ -574,7 +609,7 @@ impl GraphStore for TursoStore {
         .await
     }
 
-    async fn edge_properties(&self, edge: EdgeId) -> BTreeMap<String, Value> {
+    async fn edge_properties(&self, edge: EdgeId) -> StoreResult<BTreeMap<String, Value>> {
         self.properties(
             "SELECT key, kind, value FROM gql_edge_props WHERE edge = ?1",
             edge.0,
@@ -585,14 +620,19 @@ impl GraphStore for TursoStore {
 
 #[async_trait]
 impl GraphStoreMut for TursoStore {
-    async fn add_node(&mut self, labels: Vec<String>, props: BTreeMap<String, Value>) -> NodeId {
-        let own = self.begin_own().await;
-        let id = self
-            .insert("INSERT INTO gql_nodes DEFAULT VALUES", ())
-            .await;
-        self.insert_element("node", id, labels, props).await;
-        self.end_own(own).await;
-        NodeId(id as u64)
+    async fn add_node(
+        &mut self,
+        labels: Vec<String>,
+        props: BTreeMap<String, Value>,
+    ) -> StoreResult<NodeId> {
+        self.atomically(async || {
+            let id = self
+                .insert("INSERT INTO gql_nodes DEFAULT VALUES", ())
+                .await?;
+            self.insert_element("node", id, labels, props).await?;
+            Ok(NodeId(id as u64))
+        })
+        .await
     }
 
     async fn add_edge(
@@ -601,27 +641,33 @@ impl GraphStoreMut for TursoStore {
         target: NodeId,
         labels: Vec<String>,
         props: BTreeMap<String, Value>,
-    ) -> EdgeId {
-        let own = self.begin_own().await;
-        let id = self
-            .insert(
-                "INSERT INTO gql_edges (source, target) VALUES (?1, ?2)",
-                (source.0 as i64, target.0 as i64),
-            )
-            .await;
-        self.insert_element("edge", id, labels, props).await;
-        self.end_own(own).await;
-        EdgeId(id as u64)
+    ) -> StoreResult<EdgeId> {
+        self.atomically(async || {
+            let id = self
+                .insert(
+                    "INSERT INTO gql_edges (source, target) VALUES (?1, ?2)",
+                    (source.0 as i64, target.0 as i64),
+                )
+                .await?;
+            self.insert_element("edge", id, labels, props).await?;
+            Ok(EdgeId(id as u64))
+        })
+        .await
     }
 
-    async fn set_node_property(&mut self, node: NodeId, key: &str, value: Value) {
+    async fn set_node_property(
+        &mut self,
+        node: NodeId,
+        key: &str,
+        value: Value,
+    ) -> StoreResult<()> {
         match encode_property(&value) {
             None => {
                 self.exec(
                     "DELETE FROM gql_node_props WHERE node = ?1 AND key = ?2",
                     (node.0 as i64, key),
                 )
-                .await;
+                .await
             }
             Some((kind, value)) => {
                 self.exec(
@@ -629,26 +675,64 @@ impl GraphStoreMut for TursoStore {
                      ON CONFLICT (node, key) DO UPDATE SET kind = excluded.kind, value = excluded.value",
                     (node.0 as i64, key, kind, value),
                 )
-                .await;
+                .await
             }
         }
     }
 }
 
-/// Roll back a transaction abandoned by a dropped or panicked future.
-async fn settle(conn: &Connection, abandoned: &AtomicBool) -> turso::Result<()> {
-    if abandoned.swap(false, Ordering::SeqCst) && !conn.is_autocommit()? {
-        conn.execute("ROLLBACK", ()).await?;
+/// Classify a Turso error for callers deciding whether to retry.
+fn store_error(e: turso::Error) -> StoreError {
+    use turso::Error as T;
+    let kind = match &e {
+        T::Busy(_) | T::BusySnapshot(_) | T::Interrupt(_) | T::IoError(..) => {
+            StoreErrorKind::Unavailable
+        }
+        T::Corrupt(_) | T::NotAdb(_) => StoreErrorKind::Corrupt,
+        // The schema's only foreign keys are element ids.
+        T::Constraint(m) if m.contains("FOREIGN KEY") => StoreErrorKind::NotFound,
+        _ => StoreErrorKind::Other,
+    };
+    StoreError::new(kind, e)
+}
+
+fn corrupt(msg: impl Into<String>) -> StoreError {
+    StoreError::new(StoreErrorKind::Corrupt, msg.into())
+}
+
+const ABANDONED_NONE: u8 = 0;
+/// A mutation's savepoint inside the caller's transaction.
+const ABANDONED_SAVEPOINT: u8 = 1;
+/// A whole transaction; rolling it back also discards any savepoint.
+const ABANDONED_TRANSACTION: u8 = 2;
+
+/// Roll back what an abandoned future left open.
+async fn settle(conn: &Connection, abandoned: &AtomicU8) -> StoreResult<()> {
+    let level = abandoned.swap(ABANDONED_NONE, Ordering::SeqCst);
+    if level == ABANDONED_NONE || conn.is_autocommit().map_err(store_error)? {
+        return Ok(());
+    }
+    let undo: &[&str] = if level == ABANDONED_TRANSACTION {
+        &["ROLLBACK"]
+    } else {
+        &["ROLLBACK TO gql_mutation", "RELEASE gql_mutation"]
+    };
+    for sql in undo {
+        if let Err(e) = conn.execute(*sql, ()).await {
+            // Still open: try again on the next operation.
+            abandoned.fetch_max(level, Ordering::SeqCst);
+            return Err(store_error(e));
+        }
     }
     Ok(())
 }
 
-/// Marks the store's transaction abandoned when dropped while armed.
-struct Abandon(Option<Arc<AtomicBool>>);
+/// Records its level in the store's `abandoned` flag when dropped armed.
+struct Abandon(Option<(Arc<AtomicU8>, u8)>);
 
 impl Abandon {
-    fn arm(flag: &Arc<AtomicBool>) -> Self {
-        Abandon(Some(flag.clone()))
+    fn arm(flag: &Arc<AtomicU8>, level: u8) -> Self {
+        Abandon(Some((flag.clone(), level)))
     }
 
     fn disarm(&mut self) {
@@ -658,25 +742,36 @@ impl Abandon {
 
 impl Drop for Abandon {
     fn drop(&mut self) {
-        if let Some(flag) = self.0.take() {
-            flag.store(true, Ordering::SeqCst);
+        if let Some((flag, level)) = self.0.take() {
+            flag.fetch_max(level, Ordering::SeqCst);
         }
     }
 }
 
-fn int(row: &Row, i: usize) -> i64 {
-    match row.get_value(i) {
-        Ok(turso::Value::Integer(n)) => n,
-        other => panic!("turso store: expected integer, found {other:?}"),
+fn column(row: &Row, i: usize) -> StoreResult<turso::Value> {
+    row.get_value(i).map_err(store_error)
+}
+
+fn int(row: &Row, i: usize) -> StoreResult<i64> {
+    match column(row, i)? {
+        turso::Value::Integer(n) => Ok(n),
+        other => Err(corrupt(format!("expected an integer, found {other:?}"))),
     }
 }
 
-fn edge_ref(row: &Row) -> EdgeRef {
-    EdgeRef {
-        id: EdgeId(int(row, 0) as u64),
-        source: NodeId(int(row, 1) as u64),
-        target: NodeId(int(row, 2) as u64),
+fn text(row: &Row, i: usize) -> StoreResult<String> {
+    match column(row, i)? {
+        turso::Value::Text(s) => Ok(s),
+        other => Err(corrupt(format!("expected text, found {other:?}"))),
     }
+}
+
+fn edge_ref(row: &Row) -> StoreResult<EdgeRef> {
+    Ok(EdgeRef {
+        id: EdgeId(int(row, 0)? as u64),
+        source: NodeId(int(row, 1)? as u64),
+        target: NodeId(int(row, 2)? as u64),
+    })
 }
 
 /// `(kind, value)` columns for a property, or `None` for null, which is not
@@ -698,12 +793,9 @@ fn encode_property(v: &Value) -> Option<(i64, turso::Value)> {
 }
 
 /// Decode the `kind, value` columns starting at `i`.
-fn decode_property(row: &Row, i: usize) -> Value {
-    let kind = int(row, i);
-    let value = row
-        .get_value(i + 1)
-        .unwrap_or_else(|e| panic!("turso store: {e}"));
-    match (kind, value) {
+fn decode_property(row: &Row, i: usize) -> StoreResult<Value> {
+    let kind = int(row, i)?;
+    Ok(match (kind, column(row, i + 1)?) {
         (KIND_BOOL, turso::Value::Integer(n)) => Value::Bool(n != 0),
         (KIND_INT, turso::Value::Integer(n)) => Value::Int(n),
         (KIND_FLOAT, turso::Value::Real(x)) => Value::Float(x),
@@ -715,11 +807,13 @@ fn decode_property(row: &Row, i: usize) -> Value {
             let mut input = b.as_slice();
             match decode(&mut input) {
                 Some(v) if input.is_empty() => v,
-                _ => panic!("turso store: corrupt encoded property value"),
+                _ => return Err(corrupt("undecodable encoded property value")),
             }
         }
-        (kind, value) => panic!("turso store: property of kind {kind} holds {value:?}"),
-    }
+        (kind, value) => {
+            return Err(corrupt(format!("property of kind {kind} holds {value:?}")));
+        }
+    })
 }
 
 // Binary encoding of lists, maps and element references: a tag byte, then a
@@ -885,13 +979,16 @@ mod tests {
     fn schema_shares_the_database_and_is_versioned() {
         pollster::block_on(async {
             let g = TursoStore::in_memory().await.unwrap();
-            g.exec("CREATE TABLE app_users (name TEXT)", ()).await;
+            g.exec("CREATE TABLE app_users (name TEXT)", ())
+                .await
+                .unwrap();
             g.init_schema().await.unwrap();
             g.exec(
                 "UPDATE gql_meta SET value = 2 WHERE key = 'schema_version'",
                 (),
             )
-            .await;
+            .await
+            .unwrap();
             let err = g.init_schema().await.unwrap_err();
             assert!(
                 matches!(err, TursoStoreError::SchemaVersion { .. }),
@@ -901,21 +998,93 @@ mod tests {
     }
 
     #[test]
-    fn failed_mutation_rolls_back() {
-        let mut g = pollster::block_on(TursoStore::in_memory()).unwrap();
-        let a = pollster::block_on(g.add_node(vec!["A".into()], BTreeMap::new()));
-        // The edge row is inserted, then the dangling target fails the
-        // foreign key; the whole edge must roll back.
-        let dangling = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pollster::block_on(g.add_edge(a, NodeId(999), vec!["R".into()], BTreeMap::new()))
-        }));
-        assert!(dangling.is_err());
+    fn dangling_edge_is_not_found() {
         pollster::block_on(async {
-            assert_eq!(g.edge_count().await, 0);
+            let mut g = TursoStore::in_memory().await.unwrap();
+            let a = g.add_node(vec!["A".into()], BTreeMap::new()).await.unwrap();
+            let err = g
+                .add_edge(a, NodeId(999), vec!["R".into()], BTreeMap::new())
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), StoreErrorKind::NotFound, "{err}");
+            assert_eq!(
+                g.edge(EdgeId(1)).await.unwrap_err().kind(),
+                StoreErrorKind::NotFound
+            );
+            assert_eq!(g.edge_count().await.unwrap(), 0);
             assert!(g.conn.lock().await.is_autocommit().unwrap());
-            let b = g.add_node(vec![], BTreeMap::new()).await;
-            g.add_edge(a, b, vec!["R".into()], BTreeMap::new()).await;
-            assert_eq!((g.node_count().await, g.edge_count().await), (2, 1));
+            let b = g.add_node(vec![], BTreeMap::new()).await.unwrap();
+            g.add_edge(a, b, vec!["R".into()], BTreeMap::new())
+                .await
+                .unwrap();
+            assert_eq!(g.edge_count().await.unwrap(), 1);
+        });
+    }
+
+    /// A mutation that writes a node, then fails.
+    async fn half_done(g: &TursoStore) -> StoreResult<()> {
+        g.atomically(async || {
+            g.insert("INSERT INTO gql_nodes DEFAULT VALUES", ()).await?;
+            Err(StoreError::new(StoreErrorKind::Unavailable, "link lost"))
+        })
+        .await
+    }
+
+    #[test]
+    fn failed_mutation_is_undone() {
+        pollster::block_on(async {
+            let mut g = TursoStore::in_memory().await.unwrap();
+            // On its own: its transaction rolls back.
+            assert!(half_done(&g).await.is_err());
+            assert_eq!(g.node_count().await.unwrap(), 0);
+            assert!(g.conn.lock().await.is_autocommit().unwrap());
+            // In the caller's transaction: only its savepoint is undone, and
+            // the transaction carries on.
+            g.transaction(async |g| {
+                g.add_node(vec!["Kept".into()], BTreeMap::new()).await?;
+                assert!(half_done(g).await.is_err());
+                g.add_node(vec!["AlsoKept".into()], BTreeMap::new()).await?;
+                Ok::<_, StoreError>(())
+            })
+            .await
+            .unwrap();
+            assert_eq!(g.node_count().await.unwrap(), 2);
+        });
+    }
+
+    #[test]
+    fn cancelled_mutation_in_a_transaction_is_undone() {
+        pollster::block_on(async {
+            let mut g = TursoStore::in_memory().await.unwrap();
+            g.transaction(async |g| {
+                g.add_node(vec!["Kept".into()], BTreeMap::new()).await?;
+                // Poll a mutation until it has written, then drop it.
+                let wrote = std::sync::atomic::AtomicBool::new(false);
+                {
+                    let g = &*g;
+                    let mut m = Box::pin(g.atomically(async || {
+                        g.insert("INSERT INTO gql_nodes DEFAULT VALUES", ()).await?;
+                        wrote.store(true, Ordering::SeqCst);
+                        std::future::pending::<StoreResult<()>>().await
+                    }));
+                    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                    while !wrote.load(Ordering::SeqCst) {
+                        assert!(m.as_mut().poll(&mut cx).is_pending());
+                    }
+                }
+                g.add_node(vec!["AlsoKept".into()], BTreeMap::new()).await?;
+                Ok::<_, StoreError>(())
+            })
+            .await
+            .unwrap();
+            let labels: Vec<_> = {
+                let mut out = Vec::new();
+                for n in g.nodes().await.unwrap() {
+                    out.extend(g.node_labels(n).await.unwrap());
+                }
+                out
+            };
+            assert_eq!(labels, ["Kept", "AlsoKept"]);
         });
     }
 
@@ -924,19 +1093,21 @@ mod tests {
         pollster::block_on(async {
             let mut g = TursoStore::in_memory().await.unwrap();
             // Poll the transaction until it parks after its write, then drop it.
-            let wrote = AtomicBool::new(false);
+            let wrote = std::sync::atomic::AtomicBool::new(false);
             let mut tx = Box::pin(g.transaction(async |g| {
-                g.add_node(vec!["Lost".into()], BTreeMap::new()).await;
+                g.add_node(vec!["Lost".into()], BTreeMap::new())
+                    .await
+                    .unwrap();
                 wrote.store(true, Ordering::SeqCst);
                 std::future::pending::<()>().await;
-                Ok::<_, ()>(())
+                Ok::<_, StoreError>(())
             }));
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
             while !wrote.load(Ordering::SeqCst) {
                 assert!(tx.as_mut().poll(&mut cx).is_pending());
             }
             drop(tx);
-            assert_eq!(g.node_count().await, 0);
+            assert_eq!(g.node_count().await.unwrap(), 0);
             assert!(g.conn.lock().await.is_autocommit().unwrap());
         });
     }

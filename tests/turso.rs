@@ -59,13 +59,13 @@ fn render<'a>(
         match v {
             Value::Node(n) => format!(
                 "(:{} {})",
-                g.node_labels(*n).await.join(":"),
-                render(g, &Value::Map(g.node_properties(*n).await)).await
+                g.node_labels(*n).await.unwrap().join(":"),
+                render(g, &Value::Map(g.node_properties(*n).await.unwrap())).await
             ),
             Value::Edge(e) => format!(
                 "[:{} {}]",
-                g.edge_labels(*e).await.join(":"),
-                render(g, &Value::Map(g.edge_properties(*e).await)).await
+                g.edge_labels(*e).await.unwrap().join(":"),
+                render(g, &Value::Map(g.edge_properties(*e).await.unwrap())).await
             ),
             Value::List(xs) => {
                 let mut out = Vec::new();
@@ -139,12 +139,11 @@ fn canon_spec_matches_reference_backend() {
         let index = g
             .transaction(async |g| load_spec(TODO, g).await)
             .await
-            .unwrap()
             .unwrap();
 
         assert_eq!(index.len(), ref_index.len());
-        assert_eq!(g.node_count().await, reference.node_count());
-        assert_eq!(g.edge_count().await, reference.edge_count());
+        assert_eq!(g.node_count().await.unwrap(), reference.node_count());
+        assert_eq!(g.edge_count().await.unwrap(), reference.edge_count());
         for q in CORPUS {
             let want = rows(&reference, q).await;
             assert!(!want.is_empty() || q.contains("Nonexistent"), "{q}");
@@ -186,7 +185,10 @@ fn in_memory_stores_are_independent() {
         load_fixture(&mut a, "INSERT (:A), (:A)").await.unwrap();
         assert_eq!(a.location(), &TursoLocation::Memory);
         assert_eq!(a.path(), None);
-        assert_eq!((a.node_count().await, b.node_count().await), (2, 0));
+        assert_eq!(
+            (a.node_count().await.unwrap(), b.node_count().await.unwrap()),
+            (2, 0)
+        );
     });
 }
 
@@ -202,7 +204,6 @@ fn file_store_persists_across_reopen() {
             let index = g
                 .transaction(async |g| load_spec(TODO, g).await)
                 .await
-                .unwrap()
                 .unwrap();
             apply_overlay(r#"{"REQ-002": {"status": "satisfied"}}"#, &index, &mut g)
                 .await
@@ -216,8 +217,13 @@ fn file_store_persists_across_reopen() {
             assert_eq!(rows(&g, q).await, before, "{conn}");
             assert_eq!(rows(&g, "MATCH (n:!Extra) RETURN n").await.len(), 18);
             // Writes after reopening extend the same graph.
-            let n = g.add_node(vec!["Extra".into()], BTreeMap::new()).await;
-            g.set_node_property(n, "seen", Value::Bool(true)).await;
+            let n = g
+                .add_node(vec!["Extra".into()], BTreeMap::new())
+                .await
+                .unwrap();
+            g.set_node_property(n, "seen", Value::Bool(true))
+                .await
+                .unwrap();
         }
         let g = TursoStore::open(&db.conn()).await.unwrap();
         assert_eq!(
@@ -271,31 +277,43 @@ fn property_values_round_trip_exactly() {
     expected.remove("absent");
     block_on(async {
         let mut g = TursoStore::open(&db.conn()).await.unwrap();
-        let a = g.add_node(vec!["A".into()], props.clone()).await;
-        let b = g.add_node(vec![], BTreeMap::new()).await;
-        let e = g.add_edge(a, b, vec!["E".into()], props.clone()).await;
+        let a = g.add_node(vec!["A".into()], props.clone()).await.unwrap();
+        let b = g.add_node(vec![], BTreeMap::new()).await.unwrap();
+        let e = g
+            .add_edge(a, b, vec!["E".into()], props.clone())
+            .await
+            .unwrap();
         for (k, v) in &props {
-            g.set_node_property(b, k, v.clone()).await;
+            g.set_node_property(b, k, v.clone()).await.unwrap();
         }
-        g.set_node_property(b, "p0", Value::Null).await;
-        g.set_node_property(b, "p0", Value::Null).await;
-        g.set_node_property(b, "p1", Value::Int(7)).await;
-        assert_eq!(g.node_property(b, "p0").await, None);
-        assert_eq!(g.node_property(b, "p1").await, Some(Value::Int(7)));
-        assert_eq!(debug(&g.edge_properties(e).await), debug(&expected));
+        g.set_node_property(b, "p0", Value::Null).await.unwrap();
+        g.set_node_property(b, "p0", Value::Null).await.unwrap();
+        g.set_node_property(b, "p1", Value::Int(7)).await.unwrap();
+        assert_eq!(g.node_property(b, "p0").await.unwrap(), None);
+        assert_eq!(g.node_property(b, "p1").await.unwrap(), Some(Value::Int(7)));
+        assert_eq!(
+            debug(&g.edge_properties(e).await.unwrap()),
+            debug(&expected)
+        );
     });
     block_on(async {
         let g = TursoStore::open(&db.conn()).await.unwrap();
-        let nodes = g.nodes().await;
-        assert_eq!(debug(&g.node_properties(nodes[0]).await), debug(&expected));
+        let nodes = g.nodes().await.unwrap();
+        assert_eq!(
+            debug(&g.node_properties(nodes[0]).await.unwrap()),
+            debug(&expected)
+        );
         for (k, v) in &expected {
             assert_eq!(
-                format!("{:?}", g.node_property(nodes[0], k).await),
+                format!("{:?}", g.node_property(nodes[0], k).await.unwrap()),
                 format!("{:?}", Some(v))
             );
         }
-        assert_eq!(g.node_property(nodes[0], "absent").await, None);
-        assert_eq!(g.node_properties(nodes[1]).await.len(), expected.len() - 1);
+        assert_eq!(g.node_property(nodes[0], "absent").await.unwrap(), None);
+        assert_eq!(
+            g.node_properties(nodes[1]).await.unwrap().len(),
+            expected.len() - 1
+        );
     });
 }
 
@@ -304,16 +322,21 @@ fn labels_are_sorted_and_deduplicated() {
     block_on(async {
         let mut g = TursoStore::in_memory().await.unwrap();
         let labels = vec!["B".into(), "A".into(), "B".into()];
-        let n = g.add_node(labels, BTreeMap::new()).await;
+        let n = g.add_node(labels, BTreeMap::new()).await.unwrap();
         let e = g
             .add_edge(n, n, vec!["R".into(), "R".into()], BTreeMap::new())
-            .await;
-        assert_eq!(g.node_labels(n).await, ["A", "B"]);
-        assert!(g.node_has_label(n, "A").await && !g.node_has_label(n, "C").await);
-        assert_eq!(g.nodes_with_label("B").await, [n]);
-        assert_eq!(g.edge_labels(e).await, ["R"]);
-        assert!(g.edge_has_label(e, "R").await && !g.edge_has_label(e, "S").await);
-        assert_eq!(g.edge(e).await.source, n);
+            .await
+            .unwrap();
+        assert_eq!(g.node_labels(n).await.unwrap(), ["A", "B"]);
+        assert!(
+            g.node_has_label(n, "A").await.unwrap() && !g.node_has_label(n, "C").await.unwrap()
+        );
+        assert_eq!(g.nodes_with_label("B").await.unwrap(), [n]);
+        assert_eq!(g.edge_labels(e).await.unwrap(), ["R"]);
+        assert!(
+            g.edge_has_label(e, "R").await.unwrap() && !g.edge_has_label(e, "S").await.unwrap()
+        );
+        assert_eq!(g.edge(e).await.unwrap().source, n);
     });
 }
 
@@ -329,12 +352,12 @@ fn transaction_commits_or_rolls_back() {
                 load_spec("{not json", g).await
             })
             .await;
-        assert!(failed.unwrap().is_err());
-        assert_eq!(g.node_count().await, 0);
+        assert!(failed.is_err());
+        assert_eq!(g.node_count().await.unwrap(), 0);
     });
 
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        block_on(g.transaction(async |g| -> Result<(), ()> {
+        block_on(g.transaction(async |g| -> Result<(), slcr_gql::Error> {
             load_fixture(g, "INSERT (:Lost)").await.unwrap();
             panic!("boom")
         }))
@@ -342,17 +365,16 @@ fn transaction_commits_or_rolls_back() {
     assert!(panicked.is_err());
 
     block_on(async {
-        assert_eq!(g.node_count().await, 0);
+        assert_eq!(g.node_count().await.unwrap(), 0);
         let index = g
             .transaction(async |g| load_spec(TODO, g).await)
             .await
-            .unwrap()
             .unwrap();
         assert_eq!(index.len(), 18);
     });
     drop(g);
     let g = block_on(TursoStore::open(&db.conn())).unwrap();
-    assert_eq!(block_on(g.node_count()), 18);
+    assert_eq!(block_on(g.node_count()).unwrap(), 18);
 }
 
 #[test]
@@ -361,7 +383,7 @@ fn futures_are_send_and_the_store_is_shareable() {
     let mut g = block_on(TursoStore::in_memory()).unwrap();
     let tx = g.transaction(async |g| load_spec(TODO, g).await);
     assert_send(&tx);
-    block_on(tx).unwrap().unwrap();
+    block_on(tx).unwrap();
 
     // One store answers queries from several threads at once.
     let q = "MATCH (d:Requirement)-[:REFINES]->{1,}(:Requirement {id: 'REQ-001'}) \

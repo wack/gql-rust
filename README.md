@@ -61,6 +61,7 @@ The command also accepts the following options:
 | `tests/spec.rs` | loader tests against the canon `todo-api` example |
 | `tests/oracle.rs` | differential testing against Grafeo (`--features grafeo`) |
 | `tests/turso.rs` | `TursoStore` against the reference backend, persistence (`--features turso`) |
+| `tests/store_errors.rs` | storage failures surface as errors, via a backend whose connection drops |
 | `schema/` | the reviewed spec JSON Schema and canon example, copied from Notion |
 | `tck/` | vendored openCypher + opengql TCKs (Apache-2.0), `VERSIONS`, `baseline.tsv` |
 
@@ -73,15 +74,31 @@ own graph, implement `nodes`, `node_labels`, `node_property(ies)`, `edges`,
 `edge`, `edge_labels` and `edge_property(ies)`. If you have a label index,
 override `nodes_with_label`. Enumeration order must be deterministic.
 
+Every method returns a `StoreResult`, so a backend reports failures instead
+of panicking. Wrap the backend's own error in a `StoreError` with a kind:
+`NotFound` (an unknown id), `Unavailable` (unreachable, timed out or busy,
+so a retry may succeed), `Corrupt` or `Other`. The original error stays
+reachable through `source()`. Queries return the failure as `Error::Store`,
+and `load_spec`/`apply_overlay` return it as `SpecError::Store`.
+
 ```rust
-use slcr_gql::{GraphStore, async_trait, store::{EdgeId, EdgeRef, Incidence, NodeId}};
+use slcr_gql::{GraphStore, StoreError, StoreErrorKind, StoreResult, async_trait};
+use slcr_gql::store::{EdgeId, EdgeRef, Incidence, NodeId};
 
 #[async_trait]
-impl GraphStore for MyGraph {
-    async fn nodes(&self) -> Vec<NodeId> { self.db.all_node_ids().await }
+impl GraphStore for RemoteGraph {
+    async fn nodes(&self) -> StoreResult<Vec<NodeId>> {
+        self.client
+            .all_node_ids()
+            .await
+            .map_err(|e| StoreError::new(StoreErrorKind::Unavailable, e))
+    }
     // ...
 }
 ```
+
+`tests/store_errors.rs` has a complete example: a backend whose connection
+drops partway through a query.
 
 ### Turso
 
@@ -94,9 +111,9 @@ use slcr_gql::{Params, TursoStore, load_spec, query};
 
 let mut mem = TursoStore::open(":memory:").await?;   // discarded on drop
 let mut disk = TursoStore::open("graph.db").await?;  // created if missing, reopened later
-if disk.node_count().await == 0 {
+if disk.node_count().await? == 0 {
     // One commit for the whole load.
-    disk.transaction(async |g| load_spec(src, g).await).await??;
+    disk.transaction(async |g| load_spec(src, g).await).await?;
 }
 let r = query(&disk, "MATCH (r:Requirement) RETURN r.id", &Params::new()).await?;
 ```
@@ -110,10 +127,12 @@ let r = query(&disk, "MATCH (r:Requirement) RETURN r.id", &Params::new()).await?
 Remote databases (`libsql://`, `https://`) and URI query parameters are
 rejected. The graph lives in `gql_`-prefixed tables, so it can share a
 database with other data. See `src/store/turso_store.rs` for the layout.
-`GraphStore` is infallible, so a database failure after opening panics.
-Outside `transaction`, every `add_node`/`add_edge` is its own commit, which
-costs a disk sync on a file database. A transaction whose future is dropped
-before it finishes is rolled back. Concurrent queries on one store are
+Database failures are `StoreError`s: busy, interrupted or I/O failures are
+`Unavailable`, and a corrupt file is `Corrupt`. Each `add_node`/`add_edge`
+is all-or-nothing. Outside `transaction` it is its own commit, which costs a
+disk sync on a file database. Inside one it uses a savepoint, so a failed
+mutation is undone without aborting the transaction. A transaction whose
+future is dropped before it finishes is rolled back. Concurrent queries on one store are
 allowed, but they take turns on its single connection.
 
 Try it with `cargo run --features turso --example turso -- graph.db`. The first

@@ -15,6 +15,8 @@ pub use turso_store::{TursoLocation, TursoStore, TursoStoreError};
 use crate::value::Value;
 pub use async_trait::async_trait;
 use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u64);
@@ -37,61 +39,148 @@ pub enum Incidence {
     Incoming,
 }
 
+/// Why a storage operation failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum StoreErrorKind {
+    /// An id that does not name an element of this store.
+    NotFound,
+    /// The storage could not be reached or is busy: a network failure, a
+    /// timeout, a lock held by another writer. Retrying may succeed.
+    Unavailable,
+    /// Stored data could not be decoded.
+    Corrupt,
+    /// Any other failure.
+    Other,
+}
+
+/// A failed [`GraphStore`] or [`GraphStoreMut`] operation. Backends wrap
+/// their own errors, which stay reachable through
+/// [`source`](std::error::Error::source).
+///
+/// ```
+/// use slcr_gql::store::{StoreError, StoreErrorKind};
+///
+/// let io = std::io::Error::new(std::io::ErrorKind::TimedOut, "no reply from graph.example");
+/// let e = StoreError::new(StoreErrorKind::Unavailable, io);
+/// assert_eq!(e.kind(), StoreErrorKind::Unavailable);
+/// assert_eq!(e.to_string(), "storage unavailable: no reply from graph.example");
+/// ```
+#[derive(Debug, Clone)]
+pub struct StoreError {
+    kind: StoreErrorKind,
+    source: Arc<dyn std::error::Error + Send + Sync>,
+}
+
+impl StoreError {
+    /// Wrap `error` (any error type, or a message) as a failure of `kind`.
+    pub fn new(
+        kind: StoreErrorKind,
+        error: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        StoreError {
+            kind,
+            source: Arc::from(error.into()),
+        }
+    }
+
+    pub fn kind(&self) -> StoreErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.kind {
+            StoreErrorKind::NotFound => "not found",
+            StoreErrorKind::Unavailable => "storage unavailable",
+            StoreErrorKind::Corrupt => "corrupt stored data",
+            StoreErrorKind::Other => "storage error",
+        };
+        write!(f, "{kind}: {}", self.source)
+    }
+}
+
+impl std::error::Error for StoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
+}
+
+/// Equal when the kind and the message match, so results carrying a
+/// `StoreError` stay comparable.
+impl PartialEq for StoreError {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.source.to_string() == other.source.to_string()
+    }
+}
+
+pub type StoreResult<T> = Result<T, StoreError>;
+
 /// Read-only property-graph access used by the query evaluator.
 ///
-/// Every method is async, so a backend can do I/O (a database, a remote
-/// service) without blocking. Implement it with [`#[async_trait]`](macro@async_trait); the
-/// returned futures are `Send`, so queries can run on a multi-threaded
-/// runtime.
+/// Every method is async and fallible, so a backend can do I/O (a database,
+/// a remote service) without blocking, and report failures as a
+/// [`StoreError`] instead of panicking. Implement it with
+/// [`#[async_trait]`](macro@async_trait); the returned futures are `Send`, so
+/// queries can run on a multi-threaded runtime.
+///
+/// Ids passed in come from the same store. A backend should answer an id it
+/// does not know with [`StoreErrorKind::NotFound`] where that is cheap to
+/// detect; it must not panic.
 ///
 /// Node and edge enumeration order must be deterministic for a given graph
 /// state; SLCR relies on this for reproducible output when a query has no
 /// `ORDER BY`.
 #[async_trait]
 pub trait GraphStore: Send + Sync {
-    async fn nodes(&self) -> Vec<NodeId>;
+    async fn nodes(&self) -> StoreResult<Vec<NodeId>>;
 
     /// Nodes carrying `label`. Backends with a label index should override.
-    async fn nodes_with_label(&self, label: &str) -> Vec<NodeId> {
+    async fn nodes_with_label(&self, label: &str) -> StoreResult<Vec<NodeId>> {
         let mut out = Vec::new();
-        for n in self.nodes().await {
-            if self.node_has_label(n, label).await {
+        for n in self.nodes().await? {
+            if self.node_has_label(n, label).await? {
                 out.push(n);
             }
         }
-        out
+        Ok(out)
     }
 
-    async fn node_labels(&self, node: NodeId) -> Vec<String>;
+    async fn node_labels(&self, node: NodeId) -> StoreResult<Vec<String>>;
 
-    async fn node_has_label(&self, node: NodeId, label: &str) -> bool {
-        self.node_labels(node).await.iter().any(|l| l == label)
+    async fn node_has_label(&self, node: NodeId, label: &str) -> StoreResult<bool> {
+        Ok(self.node_labels(node).await?.iter().any(|l| l == label))
     }
 
-    async fn node_property(&self, node: NodeId, key: &str) -> Option<Value>;
+    async fn node_property(&self, node: NodeId, key: &str) -> StoreResult<Option<Value>>;
 
-    async fn node_properties(&self, node: NodeId) -> BTreeMap<String, Value>;
+    async fn node_properties(&self, node: NodeId) -> StoreResult<BTreeMap<String, Value>>;
 
     /// Edges incident to `node` in the given direction.
-    async fn edges(&self, node: NodeId, incidence: Incidence) -> Vec<EdgeRef>;
+    async fn edges(&self, node: NodeId, incidence: Incidence) -> StoreResult<Vec<EdgeRef>>;
 
-    async fn edge(&self, edge: EdgeId) -> EdgeRef;
+    async fn edge(&self, edge: EdgeId) -> StoreResult<EdgeRef>;
 
-    async fn edge_labels(&self, edge: EdgeId) -> Vec<String>;
+    async fn edge_labels(&self, edge: EdgeId) -> StoreResult<Vec<String>>;
 
-    async fn edge_has_label(&self, edge: EdgeId, label: &str) -> bool {
-        self.edge_labels(edge).await.iter().any(|l| l == label)
+    async fn edge_has_label(&self, edge: EdgeId, label: &str) -> StoreResult<bool> {
+        Ok(self.edge_labels(edge).await?.iter().any(|l| l == label))
     }
 
-    async fn edge_property(&self, edge: EdgeId, key: &str) -> Option<Value>;
+    async fn edge_property(&self, edge: EdgeId, key: &str) -> StoreResult<Option<Value>>;
 
-    async fn edge_properties(&self, edge: EdgeId) -> BTreeMap<String, Value>;
+    async fn edge_properties(&self, edge: EdgeId) -> StoreResult<BTreeMap<String, Value>>;
 }
 
 /// Mutation used by fixtures and loaders. Not part of the query profile.
 #[async_trait]
 pub trait GraphStoreMut: GraphStore {
-    async fn add_node(&mut self, labels: Vec<String>, props: BTreeMap<String, Value>) -> NodeId;
+    async fn add_node(
+        &mut self,
+        labels: Vec<String>,
+        props: BTreeMap<String, Value>,
+    ) -> StoreResult<NodeId>;
 
     async fn add_edge(
         &mut self,
@@ -99,9 +188,10 @@ pub trait GraphStoreMut: GraphStore {
         target: NodeId,
         labels: Vec<String>,
         props: BTreeMap<String, Value>,
-    ) -> EdgeId;
+    ) -> StoreResult<EdgeId>;
 
     /// Set (or, with null, remove) a node property. Used to overlay derived
     /// data such as satisfaction status.
-    async fn set_node_property(&mut self, node: NodeId, key: &str, value: Value);
+    async fn set_node_property(&mut self, node: NodeId, key: &str, value: Value)
+    -> StoreResult<()>;
 }

@@ -109,18 +109,21 @@ pub fn from_value(v: &Value, g: &dyn GraphStore) -> TV {
                 .collect(),
         ),
         Value::Node(n) => TV::Node {
-            labels: block_on(g.node_labels(*n)).into_iter().collect(),
+            labels: block_on(g.node_labels(*n)).unwrap().into_iter().collect(),
             props: block_on(g.node_properties(*n))
+                .unwrap()
                 .iter()
                 .map(|(k, x)| (k.clone(), from_value(x, g)))
                 .collect(),
         },
         Value::Edge(e) => TV::Rel {
             label: block_on(g.edge_labels(*e))
+                .unwrap()
                 .into_iter()
                 .next()
                 .unwrap_or_default(),
             props: block_on(g.edge_properties(*e))
+                .unwrap()
                 .iter()
                 .map(|(k, x)| (k.clone(), from_value(x, g)))
                 .collect(),

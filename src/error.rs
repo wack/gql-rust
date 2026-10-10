@@ -1,3 +1,4 @@
+use crate::store::StoreError;
 use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -15,6 +16,9 @@ pub enum Error {
     /// Runtime data exception, e.g. a type mismatch.
     #[error("data exception: {0}")]
     Data(String),
+    /// The graph store failed, e.g. a remote backend could not be reached.
+    #[error("store: {0}")]
+    Store(#[from] StoreError),
 }
 
 impl Error {

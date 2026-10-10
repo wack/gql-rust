@@ -469,20 +469,20 @@ fn required_label(l: &LabelExpr) -> Option<&str> {
 }
 
 impl Ctx<'_> {
-    async fn node_labeled(&self, n: NodeId, l: &LabelExpr) -> bool {
-        labels_match(l, &self.store.node_labels(n).await)
+    async fn node_labeled(&self, n: NodeId, l: &LabelExpr) -> Result<bool, Error> {
+        Ok(labels_match(l, &self.store.node_labels(n).await?))
     }
 
-    async fn edge_labeled(&self, e: EdgeId, l: &LabelExpr) -> bool {
-        labels_match(l, &self.store.edge_labels(e).await)
+    async fn edge_labeled(&self, e: EdgeId, l: &LabelExpr) -> Result<bool, Error> {
+        Ok(labels_match(l, &self.store.edge_labels(e).await?))
     }
 
-    async fn property(&self, el: Element, key: &str) -> Value {
-        match el {
-            Element::Node(n) => self.store.node_property(n, key).await,
-            Element::Edge(e) => self.store.edge_property(e, key).await,
+    async fn property(&self, el: Element, key: &str) -> Result<Value, Error> {
+        Ok(match el {
+            Element::Node(n) => self.store.node_property(n, key).await?,
+            Element::Edge(e) => self.store.edge_property(e, key).await?,
         }
-        .unwrap_or(Value::Null)
+        .unwrap_or(Value::Null))
     }
 
     async fn eval_all(&self, es: &[Expr], row: &Row, aggs: &[Value]) -> Result<Vec<Value>, Error> {
@@ -531,8 +531,8 @@ impl Ctx<'_> {
                 }
                 Expr::Property(x, key) => match self.eval(x, row, aggs).await? {
                     Value::Null => Value::Null,
-                    Value::Node(n) => self.property(Element::Node(n), key).await,
-                    Value::Edge(r) => self.property(Element::Edge(r), key).await,
+                    Value::Node(n) => self.property(Element::Node(n), key).await?,
+                    Value::Edge(r) => self.property(Element::Edge(r), key).await?,
                     Value::Map(m) => m.get(key).cloned().unwrap_or(Value::Null),
                     other => {
                         return Err(data(format!(
@@ -561,10 +561,10 @@ impl Ctx<'_> {
                             m.get(&k).cloned().unwrap_or(Value::Null)
                         }
                         (Value::Node(n), Value::String(k)) => {
-                            self.property(Element::Node(n), &k).await
+                            self.property(Element::Node(n), &k).await?
                         }
                         (Value::Edge(r), Value::String(k)) => {
-                            self.property(Element::Edge(r), &k).await
+                            self.property(Element::Edge(r), &k).await?
                         }
                         (x, i) => {
                             return Err(data(format!(
@@ -608,8 +608,8 @@ impl Ctx<'_> {
                     negated,
                 } => match self.eval(expr, row, aggs).await? {
                     Value::Null => Value::Null,
-                    Value::Node(n) => Value::Bool(self.node_labeled(n, labels).await != *negated),
-                    Value::Edge(r) => Value::Bool(self.edge_labeled(r, labels).await != *negated),
+                    Value::Node(n) => Value::Bool(self.node_labeled(n, labels).await? != *negated),
+                    Value::Edge(r) => Value::Bool(self.edge_labeled(r, labels).await? != *negated),
                     other => {
                         return Err(data(format!("label test on {}", other.type_name())));
                     }
@@ -788,7 +788,7 @@ impl Matcher<'_, '_> {
     ) -> Result<bool, Error> {
         for (k, e) in props {
             let want = self.ctx.eval(e, row, &[]).await?;
-            let have = self.ctx.property(el, k).await;
+            let have = self.ctx.property(el, k).await?;
             if equals(&have, &want) != Some(true) {
                 return Ok(false);
             }
@@ -804,7 +804,7 @@ impl Matcher<'_, '_> {
         row: &Row,
     ) -> Result<Option<Row>, Error> {
         if let Some(l) = &np.labels
-            && !self.ctx.node_labeled(node, l).await
+            && !self.ctx.node_labeled(node, l).await?
         {
             return Ok(None);
         }
@@ -831,7 +831,7 @@ impl Matcher<'_, '_> {
 
     async fn edge_ok(&self, ep: &EdgePattern, edge: EdgeId, row: &Row) -> Result<bool, Error> {
         if let Some(l) = &ep.labels
-            && !self.ctx.edge_labeled(edge, l).await
+            && !self.ctx.edge_labeled(edge, l).await?
         {
             return Ok(false);
         }
@@ -851,26 +851,43 @@ impl Matcher<'_, '_> {
     }
 
     /// Incident edges in pattern direction, as (edge, far endpoint).
-    async fn steps_from(&self, node: NodeId, dir: Direction) -> Vec<(EdgeId, NodeId)> {
+    async fn steps_from(
+        &self,
+        node: NodeId,
+        dir: Direction,
+    ) -> Result<Vec<(EdgeId, NodeId)>, Error> {
         let s = self.ctx.store;
-        let out = || async { s.edges(node, Incidence::Outgoing).await };
-        let inc = || async { s.edges(node, Incidence::Incoming).await };
-        match dir {
-            Direction::Right => out().await.iter().map(|e| (e.id, e.target)).collect(),
-            Direction::Left => inc().await.iter().map(|e| (e.id, e.source)).collect(),
+        Ok(match dir {
+            Direction::Right => s
+                .edges(node, Incidence::Outgoing)
+                .await?
+                .iter()
+                .map(|e| (e.id, e.target))
+                .collect(),
+            Direction::Left => s
+                .edges(node, Incidence::Incoming)
+                .await?
+                .iter()
+                .map(|e| (e.id, e.source))
+                .collect(),
             // A self-loop is one edge, not two traversals.
             Direction::Any => {
-                let mut v: Vec<_> = out().await.iter().map(|e| (e.id, e.target)).collect();
+                let mut v: Vec<_> = s
+                    .edges(node, Incidence::Outgoing)
+                    .await?
+                    .iter()
+                    .map(|e| (e.id, e.target))
+                    .collect();
                 v.extend(
-                    inc()
-                        .await
+                    s.edges(node, Incidence::Incoming)
+                        .await?
                         .iter()
                         .filter(|e| e.source != e.target)
                         .map(|e| (e.id, e.source)),
                 );
                 v
             }
-        }
+        })
     }
 
     async fn run(&mut self, row: Row) -> Result<(), Error> {
@@ -887,8 +904,8 @@ impl Matcher<'_, '_> {
                 Some(Value::Node(n)) => vec![*n],
                 Some(_) => vec![],
                 None => match p.start.labels.as_ref().and_then(required_label) {
-                    Some(l) => self.ctx.store.nodes_with_label(l).await,
-                    None => self.ctx.store.nodes().await,
+                    Some(l) => self.ctx.store.nodes_with_label(l).await?,
+                    None => self.ctx.store.nodes().await?,
                 },
             };
             for n in candidates {
@@ -914,7 +931,7 @@ impl Matcher<'_, '_> {
             };
             match ep.quantifier {
                 None => {
-                    for (edge, far) in self.steps_from(cur, ep.direction).await {
+                    for (edge, far) in self.steps_from(cur, ep.direction).await? {
                         if self.used.contains(&edge) || !self.edge_ok(ep, edge, &row).await? {
                             continue;
                         }
@@ -978,7 +995,7 @@ impl Matcher<'_, '_> {
             if q.max.is_some_and(|m| depth >= m) {
                 return Ok(());
             }
-            for (edge, far) in self.steps_from(cur, ep.direction).await {
+            for (edge, far) in self.steps_from(cur, ep.direction).await? {
                 if self.used.contains(&edge) {
                     continue;
                 }

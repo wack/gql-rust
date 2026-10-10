@@ -84,7 +84,7 @@ async fn node(
     }
     let id = store
         .add_node(labels(&n.labels, false)?, props(&n.props).await?)
-        .await;
+        .await?;
     if let Some(v) = &n.var {
         vars.insert(v.clone(), id);
     }
@@ -111,7 +111,7 @@ async fn insert(
         };
         store
             .add_edge(s, t, labels(&e.labels, true)?, props(&e.props).await?)
-            .await;
+            .await?;
         cur = next;
     }
     Ok(())

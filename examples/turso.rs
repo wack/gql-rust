@@ -22,11 +22,11 @@ async fn run() -> Result<()> {
     });
 
     let mut g = TursoStore::open(&conn).await?;
-    if g.node_count().await == 0 {
-        g.transaction(async |g| load_spec(TODO, g).await).await??;
-        eprintln!("{conn}: loaded {} nodes", g.node_count().await);
+    if g.node_count().await? == 0 {
+        g.transaction(async |g| load_spec(TODO, g).await).await?;
+        eprintln!("{conn}: loaded {} nodes", g.node_count().await?);
     } else {
-        eprintln!("{conn}: reusing {} stored nodes", g.node_count().await);
+        eprintln!("{conn}: reusing {} stored nodes", g.node_count().await?);
     }
 
     let r = query(&g, &q, &Params::new()).await?;

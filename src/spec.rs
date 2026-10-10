@@ -21,7 +21,7 @@
 //! loaded; [`apply_overlay`] attaches it as extra node properties.
 
 use crate::BoxFuture;
-use crate::store::{GraphStoreMut, NodeId};
+use crate::store::{GraphStoreMut, NodeId, StoreError};
 use crate::value::Value;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -38,6 +38,8 @@ pub enum SpecError {
         kind: &'static str,
         to: String,
     },
+    #[error("store: {0}")]
+    Store(#[from] StoreError),
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,16 +173,23 @@ impl Loader<'_> {
         }
         props.insert("id".into(), s(id));
         props.insert("spec".into(), s(&self.spec));
-        let n = self.store.add_node(vec![label.to_string()], props).await;
+        let n = self.store.add_node(vec![label.to_string()], props).await?;
         self.ids.insert(id.to_string(), n);
         Ok(n)
     }
 
-    async fn contains(&mut self, parent: NodeId, child: NodeId, label: &str, position: usize) {
+    async fn contains(
+        &mut self,
+        parent: NodeId,
+        child: NodeId,
+        label: &str,
+        position: usize,
+    ) -> Result<(), StoreError> {
         let props = BTreeMap::from([("position".to_string(), Value::Int(position as i64))]);
         self.store
             .add_edge(parent, child, vec![label.to_string()], props)
-            .await;
+            .await?;
+        Ok(())
     }
 
     fn refs(
@@ -209,7 +218,7 @@ impl Loader<'_> {
                     SectionChild::Section(x) => self.section(x).await?,
                     SectionChild::Requirement(x) => self.requirement(x).await?,
                 };
-                self.contains(n, c, "CONTAINS", i).await;
+                self.contains(n, c, "CONTAINS", i).await?;
             }
             Ok(n)
         })
@@ -246,11 +255,11 @@ impl Loader<'_> {
                 ("body".to_string(), s(body)),
             ]);
             let c = self.node("AcceptanceCriterion", id, props).await?;
-            self.contains(n, c, "HAS_CRITERION", i).await;
+            self.contains(n, c, "HAS_CRITERION", i).await?;
         }
         for (i, TaggedRequirement::Requirement(child)) in r.children.iter().enumerate() {
             let c = self.requirement(child).await?;
-            self.contains(n, c, "CONTAINS", i).await;
+            self.contains(n, c, "CONTAINS", i).await?;
         }
         Ok(n)
     }
@@ -277,7 +286,7 @@ pub async fn load_spec(json: &str, store: &mut dyn GraphStoreMut) -> Result<Spec
     }
     let gloss = l.node("Section", &g.id, props).await?;
     let pos = root_section.children.len();
-    l.contains(root, gloss, "CONTAINS", pos).await;
+    l.contains(root, gloss, "CONTAINS", pos).await?;
     for (i, t) in g.terms.iter().enumerate() {
         let mut props = BTreeMap::from([
             ("title".to_string(), s(&t.title)),
@@ -290,7 +299,7 @@ pub async fn load_spec(json: &str, store: &mut dyn GraphStoreMut) -> Result<Spec
             );
         }
         let n = l.node("Term", &t.id, props).await?;
-        l.contains(gloss, n, "CONTAINS", i).await;
+        l.contains(gloss, n, "CONTAINS", i).await?;
     }
 
     for (from, label, to, kinds) in std::mem::take(&mut l.pending) {
@@ -307,7 +316,7 @@ pub async fn load_spec(json: &str, store: &mut dyn GraphStoreMut) -> Result<Spec
         let source = l.ids[&from];
         l.store
             .add_edge(source, target, vec![label.to_string()], BTreeMap::new())
-            .await;
+            .await?;
     }
     Ok(l.ids)
 }
@@ -328,7 +337,7 @@ pub async fn apply_overlay(
             to: id.clone(),
         })?;
         for (k, v) in props {
-            store.set_node_property(node, &k, from_json(&v)).await;
+            store.set_node_property(node, &k, from_json(&v)).await?;
         }
     }
     Ok(())

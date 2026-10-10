@@ -125,14 +125,14 @@ pub async fn call_scalar(
         ("labels", Value::Node(n)) => Value::List(
             store
                 .node_labels(*n)
-                .await
+                .await?
                 .into_iter()
                 .map(Value::String)
                 .collect(),
         ),
         ("type", Value::Edge(e)) => store
             .edge_labels(*e)
-            .await
+            .await?
             .into_iter()
             .next()
             .map(Value::String)
