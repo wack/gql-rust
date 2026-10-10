@@ -1,18 +1,19 @@
 //! Loading the canon `todo-api` example (from the SLCR Schemas page) and
 //! querying it.
 
+use pollster::block_on;
 use slcr_gql::{Params, PetgraphStore, SpecError, Value, apply_overlay, load_spec, query};
 
 const TODO: &str = include_str!("data/todo-api.spec.json");
 
 fn load() -> (PetgraphStore, slcr_gql::SpecIndex) {
     let mut g = PetgraphStore::new();
-    let idx = load_spec(TODO, &mut g).expect("canon example loads");
+    let idx = block_on(load_spec(TODO, &mut g)).expect("canon example loads");
     (g, idx)
 }
 
 fn col(g: &PetgraphStore, q: &str) -> Vec<String> {
-    query(g, q, &Params::new())
+    block_on(query(g, q, &Params::new()))
         .unwrap_or_else(|e| panic!("{q}: {e}"))
         .rows
         .into_iter()
@@ -114,13 +115,13 @@ fn containment_is_not_refinement() {
 #[test]
 fn refining_modalities_per_parent() {
     let (g, _) = load();
-    let r = query(
+    let r = block_on(query(
         &g,
         "MATCH (p:Requirement)<-[:REFINES]-(c:Requirement)
          RETURN p.id AS parent, p.refinement AS how, collect(DISTINCT c.modality) AS modalities
          ORDER BY parent",
         &Params::new(),
-    )
+    ))
     .unwrap();
     let rows: Vec<String> = r
         .rows
@@ -147,7 +148,12 @@ fn refining_modalities_per_parent() {
 #[test]
 fn overlay_status() {
     let (mut g, idx) = load();
-    apply_overlay(r#"{"REQ-007": {"status": "satisfied"}}"#, &idx, &mut g).unwrap();
+    block_on(apply_overlay(
+        r#"{"REQ-007": {"status": "satisfied"}}"#,
+        &idx,
+        &mut g,
+    ))
+    .unwrap();
     assert_eq!(
         col(
             &g,
@@ -155,7 +161,14 @@ fn overlay_status() {
         ),
         ["REQ-007"]
     );
-    assert!(apply_overlay(r#"{"REQ-999": {"status": "x"}}"#, &idx, &mut g).is_err());
+    assert!(
+        block_on(apply_overlay(
+            r#"{"REQ-999": {"status": "x"}}"#,
+            &idx,
+            &mut g
+        ))
+        .is_err()
+    );
 }
 
 #[test]
@@ -163,17 +176,17 @@ fn rejects_dangling_and_duplicate_ids() {
     let mut g = PetgraphStore::new();
     let dangling = TODO.replace(r#""refines": ["REQ-005"]"#, r#""refines": ["REQ-404"]"#);
     assert!(matches!(
-        load_spec(&dangling, &mut g),
+        block_on(load_spec(&dangling, &mut g)),
         Err(SpecError::DanglingReference { .. })
     ));
     let wrong_kind = TODO.replace(r#""refines": ["REQ-005"]"#, r#""refines": ["SEC-002"]"#);
     assert!(matches!(
-        load_spec(&wrong_kind, &mut PetgraphStore::new()),
+        block_on(load_spec(&wrong_kind, &mut PetgraphStore::new())),
         Err(SpecError::DanglingReference { .. })
     ));
     let dup = TODO.replace(r#""id": "REQ-010""#, r#""id": "REQ-009""#);
     assert!(matches!(
-        load_spec(&dup, &mut PetgraphStore::new()),
+        block_on(load_spec(&dup, &mut PetgraphStore::new())),
         Err(SpecError::DuplicateId(_))
     ));
     let unknown = TODO.replace(
@@ -181,7 +194,7 @@ fn rejects_dangling_and_duplicate_ids() {
         r#""modality": "MAY", "status": "x", "refines": ["REQ-008"]"#,
     );
     assert!(matches!(
-        load_spec(&unknown, &mut PetgraphStore::new()),
+        block_on(load_spec(&unknown, &mut PetgraphStore::new())),
         Err(SpecError::Json(_))
     ));
 }

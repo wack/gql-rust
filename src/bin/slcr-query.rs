@@ -20,6 +20,10 @@ fn cell(v: &Value) -> String {
 }
 
 fn main() -> ExitCode {
+    pollster::block_on(run())
+}
+
+async fn run() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let (mut tsv, mut overlay, mut params, mut positional) =
         (false, None, Params::new(), Vec::new());
@@ -54,9 +58,10 @@ fn main() -> ExitCode {
     };
 
     let mut g = PetgraphStore::new();
-    let loaded = std::fs::read_to_string(spec_path)
-        .map_err(|e| e.to_string())
-        .and_then(|src| load_spec(&src, &mut g).map_err(|e| e.to_string()));
+    let loaded = match std::fs::read_to_string(spec_path) {
+        Ok(src) => load_spec(&src, &mut g).await.map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
     let index = match loaded {
         Ok(i) => i,
         Err(e) => {
@@ -65,16 +70,19 @@ fn main() -> ExitCode {
         }
     };
     if let Some(path) = overlay {
-        let res = std::fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|src| apply_overlay(&src, &index, &mut g).map_err(|e| e.to_string()));
+        let res = match std::fs::read_to_string(&path) {
+            Ok(src) => apply_overlay(&src, &index, &mut g)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
         if let Err(e) = res {
             eprintln!("{path}: {e}");
             return ExitCode::FAILURE;
         }
     }
 
-    let r = match query(&g, q, &params) {
+    let r = match query(&g, q, &params).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {e}");

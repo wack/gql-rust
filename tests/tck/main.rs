@@ -19,6 +19,7 @@
 mod gherkin;
 mod values;
 
+use pollster::block_on;
 use slcr_gql::{
     Error, GraphStore, GraphStoreMut, Params, PetgraphStore, QueryResult, load_fixture, query,
 };
@@ -82,7 +83,9 @@ fn new_store() -> Box<dyn GraphStoreMut> {
     match std::env::var("TCK_STORE").as_deref() {
         Err(_) | Ok("petgraph") => Box::new(PetgraphStore::new()),
         #[cfg(feature = "turso")]
-        Ok("turso") => Box::new(slcr_gql::TursoStore::in_memory().expect("open turso store")),
+        Ok("turso") => {
+            Box::new(block_on(slcr_gql::TursoStore::in_memory()).expect("open turso store"))
+        }
         Ok(other) => panic!("unknown TCK_STORE `{other}` (is its feature enabled?)"),
     }
 }
@@ -178,7 +181,7 @@ fn run_scenario(s: &gherkin::Scenario) -> Outcome {
                 let name = &t[4..t.len() - 6];
                 match named_graph(name) {
                     Some(src) => {
-                        if let Err(e) = load_fixture(run.store.as_mut(), &src) {
+                        if let Err(e) = block_on(load_fixture(run.store.as_mut(), &src)) {
                             return Outcome::Rejected(format!("named graph {name}: {e}"));
                         }
                     }
@@ -186,7 +189,7 @@ fn run_scenario(s: &gherkin::Scenario) -> Outcome {
                 }
             }
             "having executed" => {
-                if let Err(e) = load_fixture(run.store.as_mut(), doc) {
+                if let Err(e) = block_on(load_fixture(run.store.as_mut(), doc)) {
                     return Outcome::Rejected(format!("fixture: {e}"));
                 }
             }
@@ -200,7 +203,7 @@ fn run_scenario(s: &gherkin::Scenario) -> Outcome {
                 }
             }
             "executing query" => {
-                run.result = Some(query(run.store.as_ref(), doc, &run.params));
+                run.result = Some(block_on(query(run.store.as_ref(), doc, &run.params)));
                 if let Some(Err(Error::Unsupported { feature, .. })) = &run.result {
                     return Outcome::Rejected(format!("unsupported: {feature}"));
                 }

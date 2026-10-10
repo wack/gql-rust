@@ -1,4 +1,4 @@
-use super::{EdgeId, EdgeRef, GraphStore, GraphStoreMut, Incidence, NodeId};
+use super::{EdgeId, EdgeRef, GraphStore, GraphStoreMut, Incidence, NodeId, async_trait};
 use crate::value::Value;
 use petgraph::Direction;
 use petgraph::stable_graph::{EdgeIndex, NodeIndex, StableDiGraph};
@@ -54,31 +54,35 @@ impl PetgraphStore {
     }
 }
 
+#[async_trait]
 impl GraphStore for PetgraphStore {
-    fn nodes(&self) -> Box<dyn Iterator<Item = NodeId> + '_> {
-        Box::new(self.graph.node_indices().map(|i| NodeId(i.index() as u64)))
+    async fn nodes(&self) -> Vec<NodeId> {
+        self.graph
+            .node_indices()
+            .map(|i| NodeId(i.index() as u64))
+            .collect()
     }
 
-    fn node_labels(&self, node: NodeId) -> Vec<String> {
+    async fn node_labels(&self, node: NodeId) -> Vec<String> {
         self.graph[Self::n(node)].labels.clone()
     }
 
-    fn node_has_label(&self, node: NodeId, label: &str) -> bool {
+    async fn node_has_label(&self, node: NodeId, label: &str) -> bool {
         self.graph[Self::n(node)]
             .labels
             .binary_search_by(|l| l.as_str().cmp(label))
             .is_ok()
     }
 
-    fn node_property(&self, node: NodeId, key: &str) -> Option<Value> {
+    async fn node_property(&self, node: NodeId, key: &str) -> Option<Value> {
         self.graph[Self::n(node)].props.get(key).cloned()
     }
 
-    fn node_properties(&self, node: NodeId) -> BTreeMap<String, Value> {
+    async fn node_properties(&self, node: NodeId) -> BTreeMap<String, Value> {
         self.graph[Self::n(node)].props.clone()
     }
 
-    fn edges(&self, node: NodeId, incidence: Incidence) -> Box<dyn Iterator<Item = EdgeRef> + '_> {
+    async fn edges(&self, node: NodeId, incidence: Incidence) -> Vec<EdgeRef> {
         let dir = match incidence {
             Incidence::Outgoing => Direction::Outgoing,
             Incidence::Incoming => Direction::Incoming,
@@ -94,10 +98,10 @@ impl GraphStore for PetgraphStore {
             })
             .collect();
         v.sort_by_key(|e| e.id);
-        Box::new(v.into_iter())
+        v
     }
 
-    fn edge(&self, edge: EdgeId) -> EdgeRef {
+    async fn edge(&self, edge: EdgeId) -> EdgeRef {
         let (s, t) = self
             .graph
             .edge_endpoints(Self::e(edge))
@@ -109,25 +113,26 @@ impl GraphStore for PetgraphStore {
         }
     }
 
-    fn edge_labels(&self, edge: EdgeId) -> Vec<String> {
+    async fn edge_labels(&self, edge: EdgeId) -> Vec<String> {
         self.graph[Self::e(edge)].labels.clone()
     }
 
-    fn edge_property(&self, edge: EdgeId, key: &str) -> Option<Value> {
+    async fn edge_property(&self, edge: EdgeId, key: &str) -> Option<Value> {
         self.graph[Self::e(edge)].props.get(key).cloned()
     }
 
-    fn edge_properties(&self, edge: EdgeId) -> BTreeMap<String, Value> {
+    async fn edge_properties(&self, edge: EdgeId) -> BTreeMap<String, Value> {
         self.graph[Self::e(edge)].props.clone()
     }
 }
 
+#[async_trait]
 impl GraphStoreMut for PetgraphStore {
-    fn add_node(&mut self, labels: Vec<String>, props: BTreeMap<String, Value>) -> NodeId {
+    async fn add_node(&mut self, labels: Vec<String>, props: BTreeMap<String, Value>) -> NodeId {
         NodeId(self.graph.add_node(Element::new(labels, props)).index() as u64)
     }
 
-    fn add_edge(
+    async fn add_edge(
         &mut self,
         source: NodeId,
         target: NodeId,
@@ -142,7 +147,7 @@ impl GraphStoreMut for PetgraphStore {
         EdgeId(idx.index() as u64)
     }
 
-    fn set_node_property(&mut self, node: NodeId, key: &str, value: Value) {
+    async fn set_node_property(&mut self, node: NodeId, key: &str, value: Value) {
         let props = &mut self.graph[Self::n(node)].props;
         if value.is_null() {
             props.remove(key);

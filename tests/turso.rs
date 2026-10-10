@@ -5,12 +5,15 @@
 
 #![cfg(feature = "turso")]
 
+use pollster::block_on;
 use slcr_gql::{
     GraphStore, GraphStoreMut, Params, PetgraphStore, TursoLocation, TursoStore, Value,
     apply_overlay, load_fixture, load_spec, query,
 };
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 const TODO: &str = include_str!("data/todo-api.spec.json");
 
@@ -48,40 +51,54 @@ const CORPUS: &[&str] = &[
     "MATCH (a)-[:DEPENDS_ON]->(b), (c)-[:REFINES]->(b) RETURN a.id, b.id, c.id",
 ];
 
-fn render(g: &dyn GraphStore, v: &Value) -> String {
-    match v {
-        Value::Node(n) => format!(
-            "(:{} {})",
-            g.node_labels(*n).join(":"),
-            render(g, &Value::Map(g.node_properties(*n)))
-        ),
-        Value::Edge(e) => format!(
-            "[:{} {}]",
-            g.edge_labels(*e).join(":"),
-            render(g, &Value::Map(g.edge_properties(*e)))
-        ),
-        Value::List(xs) => {
-            let xs: Vec<String> = xs.iter().map(|x| render(g, x)).collect();
-            format!("[{}]", xs.join(", "))
+fn render<'a>(
+    g: &'a dyn GraphStore,
+    v: &'a Value,
+) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    Box::pin(async move {
+        match v {
+            Value::Node(n) => format!(
+                "(:{} {})",
+                g.node_labels(*n).await.join(":"),
+                render(g, &Value::Map(g.node_properties(*n).await)).await
+            ),
+            Value::Edge(e) => format!(
+                "[:{} {}]",
+                g.edge_labels(*e).await.join(":"),
+                render(g, &Value::Map(g.edge_properties(*e).await)).await
+            ),
+            Value::List(xs) => {
+                let mut out = Vec::new();
+                for x in xs {
+                    out.push(render(g, x).await);
+                }
+                format!("[{}]", out.join(", "))
+            }
+            Value::Map(m) => {
+                let mut kv = Vec::new();
+                for (k, x) in m {
+                    kv.push(format!("{k}: {}", render(g, x).await));
+                }
+                format!("{{{}}}", kv.join(", "))
+            }
+            other => other.to_string(),
         }
-        Value::Map(m) => {
-            let kv: Vec<String> = m
-                .iter()
-                .map(|(k, x)| format!("{k}: {}", render(g, x)))
-                .collect();
-            format!("{{{}}}", kv.join(", "))
-        }
-        other => other.to_string(),
-    }
+    })
 }
 
-fn rows(g: &dyn GraphStore, q: &str) -> Vec<Vec<String>> {
-    query(g, q, &Params::new())
-        .unwrap_or_else(|e| panic!("{q}: {e}"))
-        .rows
-        .iter()
-        .map(|r| r.iter().map(|v| render(g, v)).collect())
-        .collect()
+async fn rows(g: &dyn GraphStore, q: &str) -> Vec<Vec<String>> {
+    let r = query(g, q, &Params::new())
+        .await
+        .unwrap_or_else(|e| panic!("{q}: {e}"));
+    let mut out = Vec::new();
+    for row in &r.rows {
+        let mut cells = Vec::new();
+        for v in row {
+            cells.push(render(g, v).await);
+        }
+        out.push(cells);
+    }
+    out
 }
 
 /// A fresh database file path under the target directory.
@@ -115,77 +132,99 @@ impl Drop for TempDb {
 
 #[test]
 fn canon_spec_matches_reference_backend() {
-    let mut reference = PetgraphStore::new();
-    let ref_index = load_spec(TODO, &mut reference).unwrap();
-    let mut g = TursoStore::open(":memory:").unwrap();
-    let index = g.transaction(|g| load_spec(TODO, g)).unwrap().unwrap();
+    block_on(async {
+        let mut reference = PetgraphStore::new();
+        let ref_index = load_spec(TODO, &mut reference).await.unwrap();
+        let mut g = TursoStore::open(":memory:").await.unwrap();
+        let index = g
+            .transaction(async |g| load_spec(TODO, g).await)
+            .await
+            .unwrap()
+            .unwrap();
 
-    assert_eq!(index.len(), ref_index.len());
-    assert_eq!(g.node_count(), reference.node_count());
-    assert_eq!(g.edge_count(), reference.edge_count());
-    for q in CORPUS {
-        let want = rows(&reference, q);
-        assert!(!want.is_empty() || q.contains("Nonexistent"), "{q}");
-        assert_eq!(rows(&g, q), want, "{q}");
-    }
+        assert_eq!(index.len(), ref_index.len());
+        assert_eq!(g.node_count().await, reference.node_count());
+        assert_eq!(g.edge_count().await, reference.edge_count());
+        for q in CORPUS {
+            let want = rows(&reference, q).await;
+            assert!(!want.is_empty() || q.contains("Nonexistent"), "{q}");
+            assert_eq!(rows(&g, q).await, want, "{q}");
+        }
+    });
 }
 
 #[test]
 fn errors_match_reference_backend() {
-    let mut reference = PetgraphStore::new();
-    let mut g = TursoStore::in_memory().unwrap();
-    let fixture = "INSERT (a {n: 1})-[:R]->(b {n: 0})";
-    load_fixture(&mut reference, fixture).unwrap();
-    load_fixture(&mut g, fixture).unwrap();
-    for q in [
-        "MATCH (a)-[:R]->(b) RETURN a.n / b.n",
-        "MATCH (n) RETURN n.n + 'x'",
-        "MATCH (n) WITH n RETURN n",
-    ] {
-        let want = query(&reference, q, &Params::new()).map_err(|e| e.to_string());
-        let got = query(&g, q, &Params::new()).map_err(|e| e.to_string());
-        assert!(want.is_err(), "{q}");
-        assert_eq!(got.err(), want.err(), "{q}");
-    }
+    block_on(async {
+        let mut reference = PetgraphStore::new();
+        let mut g = TursoStore::in_memory().await.unwrap();
+        let fixture = "INSERT (a {n: 1})-[:R]->(b {n: 0})";
+        load_fixture(&mut reference, fixture).await.unwrap();
+        load_fixture(&mut g, fixture).await.unwrap();
+        for q in [
+            "MATCH (a)-[:R]->(b) RETURN a.n / b.n",
+            "MATCH (n) RETURN n.n + 'x'",
+            "MATCH (n) WITH n RETURN n",
+        ] {
+            let want = query(&reference, q, &Params::new())
+                .await
+                .map_err(|e| e.to_string());
+            let got = query(&g, q, &Params::new())
+                .await
+                .map_err(|e| e.to_string());
+            assert!(want.is_err(), "{q}");
+            assert_eq!(got.err(), want.err(), "{q}");
+        }
+    });
 }
 
 #[test]
 fn in_memory_stores_are_independent() {
-    let mut a = TursoStore::open(":memory:").unwrap();
-    let b = TursoStore::open("file::memory:").unwrap();
-    load_fixture(&mut a, "INSERT (:A), (:A)").unwrap();
-    assert_eq!(a.location(), &TursoLocation::Memory);
-    assert_eq!(a.path(), None);
-    assert_eq!((a.node_count(), b.node_count()), (2, 0));
+    block_on(async {
+        let mut a = TursoStore::open(":memory:").await.unwrap();
+        let b = TursoStore::open("file::memory:").await.unwrap();
+        load_fixture(&mut a, "INSERT (:A), (:A)").await.unwrap();
+        assert_eq!(a.location(), &TursoLocation::Memory);
+        assert_eq!(a.path(), None);
+        assert_eq!((a.node_count().await, b.node_count().await), (2, 0));
+    });
 }
 
 #[test]
 fn file_store_persists_across_reopen() {
-    let db = TempDb::new("persists");
-    let q = "MATCH (d:Requirement)-[:REFINES]->{1,}(:Requirement {id: 'REQ-001'}) \
-             RETURN DISTINCT d.id, d.status ORDER BY d.id";
-    let before = {
-        let mut g = TursoStore::open(&db.conn()).unwrap();
-        assert_eq!(g.path(), Some(db.0.as_path()));
-        let index = g.transaction(|g| load_spec(TODO, g)).unwrap().unwrap();
-        apply_overlay(r#"{"REQ-002": {"status": "satisfied"}}"#, &index, &mut g).unwrap();
-        rows(&g, q)
-    };
-    assert_eq!(before[0], ["'REQ-002'", "'satisfied'"]);
+    block_on(async {
+        let db = TempDb::new("persists");
+        let q = "MATCH (d:Requirement)-[:REFINES]->{1,}(:Requirement {id: 'REQ-001'}) \
+                 RETURN DISTINCT d.id, d.status ORDER BY d.id";
+        let before = {
+            let mut g = TursoStore::open(&db.conn()).await.unwrap();
+            assert_eq!(g.path(), Some(db.0.as_path()));
+            let index = g
+                .transaction(async |g| load_spec(TODO, g).await)
+                .await
+                .unwrap()
+                .unwrap();
+            apply_overlay(r#"{"REQ-002": {"status": "satisfied"}}"#, &index, &mut g)
+                .await
+                .unwrap();
+            rows(&g, q).await
+        };
+        assert_eq!(before[0], ["'REQ-002'", "'satisfied'"]);
 
-    for conn in [db.conn(), format!("file:{}", db.conn())] {
-        let mut g = TursoStore::open(&conn).unwrap();
-        assert_eq!(rows(&g, q), before, "{conn}");
-        assert_eq!(rows(&g, "MATCH (n:!Extra) RETURN n").len(), 18);
-        // Writes after reopening extend the same graph.
-        let n = g.add_node(vec!["Extra".into()], BTreeMap::new());
-        g.set_node_property(n, "seen", Value::Bool(true));
-    }
-    let g = TursoStore::open(&db.conn()).unwrap();
-    assert_eq!(
-        rows(&g, "MATCH (n:Extra) RETURN n.seen"),
-        [["true"], ["true"]]
-    );
+        for conn in [db.conn(), format!("file:{}", db.conn())] {
+            let mut g = TursoStore::open(&conn).await.unwrap();
+            assert_eq!(rows(&g, q).await, before, "{conn}");
+            assert_eq!(rows(&g, "MATCH (n:!Extra) RETURN n").await.len(), 18);
+            // Writes after reopening extend the same graph.
+            let n = g.add_node(vec!["Extra".into()], BTreeMap::new()).await;
+            g.set_node_property(n, "seen", Value::Bool(true)).await;
+        }
+        let g = TursoStore::open(&db.conn()).await.unwrap();
+        assert_eq!(
+            rows(&g, "MATCH (n:Extra) RETURN n.seen").await,
+            [["true"], ["true"]]
+        );
+    });
 }
 
 #[test]
@@ -230,80 +269,124 @@ fn property_values_round_trip_exactly() {
     let debug = |m: &BTreeMap<String, Value>| format!("{m:?}");
     let mut expected = props.clone();
     expected.remove("absent");
-    {
-        let mut g = TursoStore::open(&db.conn()).unwrap();
-        let a = g.add_node(vec!["A".into()], props.clone());
-        let b = g.add_node(vec![], BTreeMap::new());
-        let e = g.add_edge(a, b, vec!["E".into()], props.clone());
+    block_on(async {
+        let mut g = TursoStore::open(&db.conn()).await.unwrap();
+        let a = g.add_node(vec!["A".into()], props.clone()).await;
+        let b = g.add_node(vec![], BTreeMap::new()).await;
+        let e = g.add_edge(a, b, vec!["E".into()], props.clone()).await;
         for (k, v) in &props {
-            g.set_node_property(b, k, v.clone());
+            g.set_node_property(b, k, v.clone()).await;
         }
-        g.set_node_property(b, "p0", Value::Null);
-        g.set_node_property(b, "p0", Value::Null);
-        g.set_node_property(b, "p1", Value::Int(7));
-        assert_eq!(g.node_property(b, "p0"), None);
-        assert_eq!(g.node_property(b, "p1"), Some(Value::Int(7)));
-        assert_eq!(debug(&g.edge_properties(e)), debug(&expected));
-    }
-    let g = TursoStore::open(&db.conn()).unwrap();
-    let nodes: Vec<_> = g.nodes().collect();
-    assert_eq!(debug(&g.node_properties(nodes[0])), debug(&expected));
-    for (k, v) in &expected {
-        assert_eq!(
-            format!("{:?}", g.node_property(nodes[0], k)),
-            format!("{:?}", Some(v))
-        );
-    }
-    assert_eq!(g.node_property(nodes[0], "absent"), None);
-    assert_eq!(g.node_properties(nodes[1]).len(), expected.len() - 1);
+        g.set_node_property(b, "p0", Value::Null).await;
+        g.set_node_property(b, "p0", Value::Null).await;
+        g.set_node_property(b, "p1", Value::Int(7)).await;
+        assert_eq!(g.node_property(b, "p0").await, None);
+        assert_eq!(g.node_property(b, "p1").await, Some(Value::Int(7)));
+        assert_eq!(debug(&g.edge_properties(e).await), debug(&expected));
+    });
+    block_on(async {
+        let g = TursoStore::open(&db.conn()).await.unwrap();
+        let nodes = g.nodes().await;
+        assert_eq!(debug(&g.node_properties(nodes[0]).await), debug(&expected));
+        for (k, v) in &expected {
+            assert_eq!(
+                format!("{:?}", g.node_property(nodes[0], k).await),
+                format!("{:?}", Some(v))
+            );
+        }
+        assert_eq!(g.node_property(nodes[0], "absent").await, None);
+        assert_eq!(g.node_properties(nodes[1]).await.len(), expected.len() - 1);
+    });
 }
 
 #[test]
 fn labels_are_sorted_and_deduplicated() {
-    let mut g = TursoStore::in_memory().unwrap();
-    let n = g.add_node(vec!["B".into(), "A".into(), "B".into()], BTreeMap::new());
-    let e = g.add_edge(n, n, vec!["R".into(), "R".into()], BTreeMap::new());
-    assert_eq!(g.node_labels(n), ["A", "B"]);
-    assert!(g.node_has_label(n, "A") && !g.node_has_label(n, "C"));
-    assert_eq!(g.nodes_with_label("B").collect::<Vec<_>>(), [n]);
-    assert_eq!(g.edge_labels(e), ["R"]);
-    assert!(g.edge_has_label(e, "R") && !g.edge_has_label(e, "S"));
-    assert_eq!(g.edge(e).source, n);
+    block_on(async {
+        let mut g = TursoStore::in_memory().await.unwrap();
+        let labels = vec!["B".into(), "A".into(), "B".into()];
+        let n = g.add_node(labels, BTreeMap::new()).await;
+        let e = g
+            .add_edge(n, n, vec!["R".into(), "R".into()], BTreeMap::new())
+            .await;
+        assert_eq!(g.node_labels(n).await, ["A", "B"]);
+        assert!(g.node_has_label(n, "A").await && !g.node_has_label(n, "C").await);
+        assert_eq!(g.nodes_with_label("B").await, [n]);
+        assert_eq!(g.edge_labels(e).await, ["R"]);
+        assert!(g.edge_has_label(e, "R").await && !g.edge_has_label(e, "S").await);
+        assert_eq!(g.edge(e).await.source, n);
+    });
 }
 
 #[test]
 fn transaction_commits_or_rolls_back() {
     let db = TempDb::new("transactions");
-    let mut g = TursoStore::open(&db.conn()).unwrap();
+    let mut g = block_on(TursoStore::open(&db.conn())).unwrap();
 
-    let failed = g.transaction(|g| {
-        load_fixture(g, "INSERT (:Kept)").unwrap();
-        load_spec("{not json", g)
+    block_on(async {
+        let failed = g
+            .transaction(async |g| {
+                load_fixture(g, "INSERT (:Kept)").await.unwrap();
+                load_spec("{not json", g).await
+            })
+            .await;
+        assert!(failed.unwrap().is_err());
+        assert_eq!(g.node_count().await, 0);
     });
-    assert!(failed.unwrap().is_err());
-    assert_eq!(g.node_count(), 0);
 
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        g.transaction(|g| -> Result<(), ()> {
-            load_fixture(g, "INSERT (:Lost)").unwrap();
+        block_on(g.transaction(async |g| -> Result<(), ()> {
+            load_fixture(g, "INSERT (:Lost)").await.unwrap();
             panic!("boom")
-        })
+        }))
     }));
     assert!(panicked.is_err());
-    assert_eq!(g.node_count(), 0);
 
-    let index = g.transaction(|g| load_spec(TODO, g)).unwrap().unwrap();
-    assert_eq!(index.len(), 18);
+    block_on(async {
+        assert_eq!(g.node_count().await, 0);
+        let index = g
+            .transaction(async |g| load_spec(TODO, g).await)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(index.len(), 18);
+    });
     drop(g);
-    assert_eq!(TursoStore::open(&db.conn()).unwrap().node_count(), 18);
+    let g = block_on(TursoStore::open(&db.conn())).unwrap();
+    assert_eq!(block_on(g.node_count()), 18);
+}
+
+#[test]
+fn futures_are_send_and_the_store_is_shareable() {
+    fn assert_send<T: Send>(_: &T) {}
+    let mut g = block_on(TursoStore::in_memory()).unwrap();
+    let tx = g.transaction(async |g| load_spec(TODO, g).await);
+    assert_send(&tx);
+    block_on(tx).unwrap().unwrap();
+
+    // One store answers queries from several threads at once.
+    let q = "MATCH (d:Requirement)-[:REFINES]->{1,}(:Requirement {id: 'REQ-001'}) \
+             RETURN DISTINCT d.id ORDER BY d.id";
+    let want = block_on(rows(&g, q));
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..4).map(|_| s.spawn(|| block_on(rows(&g, q)))).collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap(), want);
+        }
+    });
 }
 
 #[test]
 fn bad_connection_strings_are_rejected() {
-    for conn in ["", "libsql://my-db.turso.io", "file:graph.db?mode=ro"] {
-        let err = TursoStore::open(conn).unwrap_err().to_string();
-        assert!(err.contains("invalid Turso connection string"), "{err}");
-    }
-    let missing_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no/such/dir/graph.db");
-    assert!(TursoStore::open(missing_dir.to_str().unwrap()).is_err());
+    block_on(async {
+        for conn in ["", "libsql://my-db.turso.io", "file:graph.db?mode=ro"] {
+            let err = TursoStore::open(conn).await.unwrap_err().to_string();
+            assert!(err.contains("invalid Turso connection string"), "{err}");
+        }
+        let missing_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no/such/dir/graph.db");
+        assert!(
+            TursoStore::open(missing_dir.to_str().unwrap())
+                .await
+                .is_err()
+        );
+    });
 }

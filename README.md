@@ -8,13 +8,20 @@ graph. See [PROFILE.md](PROFILE.md) for the normative grammar and semantics.
 use slcr_gql::{Params, PetgraphStore, load_fixture, query};
 
 let mut g = PetgraphStore::new();
-load_fixture(&mut g, "INSERT (:Requirement {id: 'REQ-2'})-[:REFINES]->(:Requirement {id: 'REQ-1'})")?;
+load_fixture(&mut g, "INSERT (:Requirement {id: 'REQ-2'})-[:REFINES]->(:Requirement {id: 'REQ-1'})").await?;
 let r = query(
     &g,
     "MATCH (d)-[:REFINES]->{1,}(:Requirement {id: 'REQ-1'}) RETURN d.id AS dependent",
     &Params::new(),
-)?;
+)
+.await?;
 ```
+
+The API is async: `query`, `execute`, `load_fixture`, `load_spec` and
+`apply_overlay` return futures, and so does every `GraphStore` method. The
+crate does not depend on a runtime, and its futures are `Send`, so they run on
+tokio, smol or a plain `pollster::block_on` alike. Parsing (`parse_query`) is
+synchronous.
 
 ## Command line
 
@@ -59,10 +66,22 @@ The command also accepts the following options:
 
 ## Backends
 
-The evaluator only uses the `GraphStore` trait. To back queries with SLCR's
+The evaluator only uses the `GraphStore` trait (plus `GraphStoreMut` for
+loading). Both are async traits, implemented with `#[async_trait]`, which the
+crate re-exports. Stores must be `Send + Sync`. To back queries with SLCR's
 own graph, implement `nodes`, `node_labels`, `node_property(ies)`, `edges`,
 `edge`, `edge_labels` and `edge_property(ies)`. If you have a label index,
-override `nodes_with_label`. Iteration must be deterministic.
+override `nodes_with_label`. Enumeration order must be deterministic.
+
+```rust
+use slcr_gql::{GraphStore, async_trait, store::{EdgeId, EdgeRef, Incidence, NodeId}};
+
+#[async_trait]
+impl GraphStore for MyGraph {
+    async fn nodes(&self) -> Vec<NodeId> { self.db.all_node_ids().await }
+    // ...
+}
+```
 
 ### Turso
 
@@ -73,12 +92,13 @@ string decides whether the graph is in memory or persisted to a file:
 ```rust
 use slcr_gql::{Params, TursoStore, load_spec, query};
 
-let mut mem = TursoStore::open(":memory:")?;      // discarded on drop
-let mut disk = TursoStore::open("graph.db")?;     // created if missing, reopened later
-if disk.node_count() == 0 {
-    disk.transaction(|g| load_spec(src, g))??;    // one commit for the whole load
+let mut mem = TursoStore::open(":memory:").await?;   // discarded on drop
+let mut disk = TursoStore::open("graph.db").await?;  // created if missing, reopened later
+if disk.node_count().await == 0 {
+    // One commit for the whole load.
+    disk.transaction(async |g| load_spec(src, g).await).await??;
 }
-let r = query(&disk, "MATCH (r:Requirement) RETURN r.id", &Params::new())?;
+let r = query(&disk, "MATCH (r:Requirement) RETURN r.id", &Params::new()).await?;
 ```
 
 | Connection string | Database |
@@ -92,7 +112,9 @@ rejected. The graph lives in `gql_`-prefixed tables, so it can share a
 database with other data. See `src/store/turso_store.rs` for the layout.
 `GraphStore` is infallible, so a database failure after opening panics.
 Outside `transaction`, every `add_node`/`add_edge` is its own commit, which
-costs a disk sync on a file database.
+costs a disk sync on a file database. A transaction whose future is dropped
+before it finishes is rolled back. Concurrent queries on one store are
+allowed, but they take turns on its single connection.
 
 Try it with `cargo run --features turso --example turso -- graph.db`. The first
 run loads the canon spec, and later runs query the stored graph.

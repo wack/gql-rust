@@ -5,6 +5,7 @@
 //! default match mode and coincides with Cypher's relationship isomorphism,
 //! and it guarantees termination of unbounded quantifiers on finite graphs.
 
+use crate::BoxFuture;
 use crate::ast::*;
 use crate::error::Error;
 use crate::functions::{self, call_scalar, is_aggregate};
@@ -422,6 +423,13 @@ struct Ctx<'a> {
     params: &'a Params,
 }
 
+/// A graph element whose properties a pattern constrains.
+#[derive(Clone, Copy)]
+enum Element {
+    Node(NodeId),
+    Edge(EdgeId),
+}
+
 fn data(msg: impl Into<String>) -> Error {
     Error::Data(msg.into())
 }
@@ -441,13 +449,13 @@ fn from_truth(t: Option<bool>) -> Value {
     t.map(Value::Bool).unwrap_or(Value::Null)
 }
 
-fn labels_match(l: &LabelExpr, has: &dyn Fn(&str) -> bool, any: bool) -> bool {
+fn labels_match(l: &LabelExpr, labels: &[String]) -> bool {
     match l {
-        LabelExpr::Label(s) => has(s),
-        LabelExpr::Wildcard => any,
-        LabelExpr::And(a, b) => labels_match(a, has, any) && labels_match(b, has, any),
-        LabelExpr::Or(a, b) => labels_match(a, has, any) || labels_match(b, has, any),
-        LabelExpr::Not(a) => !labels_match(a, has, any),
+        LabelExpr::Label(s) => labels.iter().any(|x| x == s),
+        LabelExpr::Wildcard => !labels.is_empty(),
+        LabelExpr::And(a, b) => labels_match(a, labels) && labels_match(b, labels),
+        LabelExpr::Or(a, b) => labels_match(a, labels) || labels_match(b, labels),
+        LabelExpr::Not(a) => !labels_match(a, labels),
     }
 }
 
@@ -461,143 +469,172 @@ fn required_label(l: &LabelExpr) -> Option<&str> {
 }
 
 impl Ctx<'_> {
-    fn node_labeled(&self, n: NodeId, l: &LabelExpr) -> bool {
-        let any = !self.store.node_labels(n).is_empty();
-        labels_match(l, &|s| self.store.node_has_label(n, s), any)
+    async fn node_labeled(&self, n: NodeId, l: &LabelExpr) -> bool {
+        labels_match(l, &self.store.node_labels(n).await)
     }
 
-    fn edge_labeled(&self, e: EdgeId, l: &LabelExpr) -> bool {
-        let any = !self.store.edge_labels(e).is_empty();
-        labels_match(l, &|s| self.store.edge_has_label(e, s), any)
+    async fn edge_labeled(&self, e: EdgeId, l: &LabelExpr) -> bool {
+        labels_match(l, &self.store.edge_labels(e).await)
     }
 
-    fn eval(&self, e: &Expr, row: &Row, aggs: &[Value]) -> Result<Value, Error> {
-        Ok(match e {
-            Expr::Literal(l) => match l {
-                Literal::Null => Value::Null,
-                Literal::Bool(b) => Value::Bool(*b),
-                Literal::Int(i) => Value::Int(*i),
-                Literal::Float(x) => Value::Float(*x),
-                Literal::String(s) => Value::String(s.clone()),
-            },
-            Expr::Param(p) => self
-                .params
-                .get(p)
-                .cloned()
-                .ok_or_else(|| Error::Semantic(format!("missing parameter `${p}`")))?,
-            Expr::Var(v) => row
-                .get(v)
-                .cloned()
-                .ok_or_else(|| Error::Semantic(format!("undefined variable `{v}`")))?,
-            Expr::AggRef(i) => aggs[*i].clone(),
-            Expr::CountStar => return Err(Error::Semantic("count(*) outside aggregation".into())),
-            Expr::List(xs) => Value::List(
-                xs.iter()
-                    .map(|x| self.eval(x, row, aggs))
-                    .collect::<Result<_, _>>()?,
-            ),
-            Expr::Map(m) => Value::Map(
-                m.iter()
-                    .map(|(k, x)| Ok((k.clone(), self.eval(x, row, aggs)?)))
-                    .collect::<Result<_, Error>>()?,
-            ),
-            Expr::Property(x, key) => match self.eval(x, row, aggs)? {
-                Value::Null => Value::Null,
-                Value::Node(n) => self.store.node_property(n, key).unwrap_or(Value::Null),
-                Value::Edge(r) => self.store.edge_property(r, key).unwrap_or(Value::Null),
-                Value::Map(m) => m.get(key).cloned().unwrap_or(Value::Null),
-                other => {
-                    return Err(data(format!(
-                        "cannot access property of {}",
-                        other.type_name()
-                    )));
+    async fn property(&self, el: Element, key: &str) -> Value {
+        match el {
+            Element::Node(n) => self.store.node_property(n, key).await,
+            Element::Edge(e) => self.store.edge_property(e, key).await,
+        }
+        .unwrap_or(Value::Null)
+    }
+
+    async fn eval_all(&self, es: &[Expr], row: &Row, aggs: &[Value]) -> Result<Vec<Value>, Error> {
+        let mut out = Vec::with_capacity(es.len());
+        for e in es {
+            out.push(self.eval(e, row, aggs).await?);
+        }
+        Ok(out)
+    }
+
+    fn eval<'s>(
+        &'s self,
+        e: &'s Expr,
+        row: &'s Row,
+        aggs: &'s [Value],
+    ) -> BoxFuture<'s, Result<Value, Error>> {
+        Box::pin(async move {
+            Ok(match e {
+                Expr::Literal(l) => match l {
+                    Literal::Null => Value::Null,
+                    Literal::Bool(b) => Value::Bool(*b),
+                    Literal::Int(i) => Value::Int(*i),
+                    Literal::Float(x) => Value::Float(*x),
+                    Literal::String(s) => Value::String(s.clone()),
+                },
+                Expr::Param(p) => self
+                    .params
+                    .get(p)
+                    .cloned()
+                    .ok_or_else(|| Error::Semantic(format!("missing parameter `${p}`")))?,
+                Expr::Var(v) => row
+                    .get(v)
+                    .cloned()
+                    .ok_or_else(|| Error::Semantic(format!("undefined variable `{v}`")))?,
+                Expr::AggRef(i) => aggs[*i].clone(),
+                Expr::CountStar => {
+                    return Err(Error::Semantic("count(*) outside aggregation".into()));
                 }
-            },
-            Expr::Index(x, i) => {
-                let (x, i) = (self.eval(x, row, aggs)?, self.eval(i, row, aggs)?);
-                match (x, i) {
-                    (Value::Null, _) | (_, Value::Null) => Value::Null,
-                    (Value::List(xs), Value::Int(i)) => {
-                        let len = xs.len() as i64;
-                        let idx = if i < 0 { len + i } else { i };
-                        if (0..len).contains(&idx) {
-                            xs[idx as usize].clone()
-                        } else {
-                            Value::Null
-                        }
+                Expr::List(xs) => Value::List(self.eval_all(xs, row, aggs).await?),
+                Expr::Map(m) => {
+                    let mut out = BTreeMap::new();
+                    for (k, x) in m {
+                        out.insert(k.clone(), self.eval(x, row, aggs).await?);
                     }
-                    (Value::Map(m), Value::String(k)) => m.get(&k).cloned().unwrap_or(Value::Null),
-                    (Value::Node(n), Value::String(k)) => {
-                        self.store.node_property(n, &k).unwrap_or(Value::Null)
-                    }
-                    (Value::Edge(r), Value::String(k)) => {
-                        self.store.edge_property(r, &k).unwrap_or(Value::Null)
-                    }
-                    (x, i) => {
+                    Value::Map(out)
+                }
+                Expr::Property(x, key) => match self.eval(x, row, aggs).await? {
+                    Value::Null => Value::Null,
+                    Value::Node(n) => self.property(Element::Node(n), key).await,
+                    Value::Edge(r) => self.property(Element::Edge(r), key).await,
+                    Value::Map(m) => m.get(key).cloned().unwrap_or(Value::Null),
+                    other => {
                         return Err(data(format!(
-                            "cannot index {} with {}",
-                            x.type_name(),
-                            i.type_name()
+                            "cannot access property of {}",
+                            other.type_name()
                         )));
                     }
-                }
-            }
-            Expr::Unary(op, x) => {
-                let v = self.eval(x, row, aggs)?;
-                match (op, v) {
-                    (_, Value::Null) => Value::Null,
-                    (UnOp::Not, v) => from_truth(truth(&v, "NOT")?.map(|b| !b)),
-                    (UnOp::Neg, Value::Int(i)) => {
-                        Value::Int(i.checked_neg().ok_or_else(|| data("integer overflow"))?)
+                },
+                Expr::Index(x, i) => {
+                    let (x, i) = (
+                        self.eval(x, row, aggs).await?,
+                        self.eval(i, row, aggs).await?,
+                    );
+                    match (x, i) {
+                        (Value::Null, _) | (_, Value::Null) => Value::Null,
+                        (Value::List(xs), Value::Int(i)) => {
+                            let len = xs.len() as i64;
+                            let idx = if i < 0 { len + i } else { i };
+                            if (0..len).contains(&idx) {
+                                xs[idx as usize].clone()
+                            } else {
+                                Value::Null
+                            }
+                        }
+                        (Value::Map(m), Value::String(k)) => {
+                            m.get(&k).cloned().unwrap_or(Value::Null)
+                        }
+                        (Value::Node(n), Value::String(k)) => {
+                            self.property(Element::Node(n), &k).await
+                        }
+                        (Value::Edge(r), Value::String(k)) => {
+                            self.property(Element::Edge(r), &k).await
+                        }
+                        (x, i) => {
+                            return Err(data(format!(
+                                "cannot index {} with {}",
+                                x.type_name(),
+                                i.type_name()
+                            )));
+                        }
                     }
-                    (UnOp::Neg, Value::Float(f)) => Value::Float(-f),
-                    (UnOp::Pos, v @ (Value::Int(_) | Value::Float(_))) => v,
-                    (_, v) => return Err(data(format!("unary operator on {}", v.type_name()))),
                 }
-            }
-            Expr::Binary(op, a, b) => self.binary(*op, a, b, row, aggs)?,
-            Expr::IsNull { expr, negated } => {
-                Value::Bool(self.eval(expr, row, aggs)?.is_null() != *negated)
-            }
-            Expr::IsLabeled {
-                expr,
-                labels,
-                negated,
-            } => match self.eval(expr, row, aggs)? {
-                Value::Null => Value::Null,
-                Value::Node(n) => Value::Bool(self.node_labeled(n, labels) != *negated),
-                Value::Edge(r) => Value::Bool(self.edge_labeled(r, labels) != *negated),
-                other => {
-                    return Err(data(format!("label test on {}", other.type_name())));
+                Expr::Unary(op, x) => {
+                    let v = self.eval(x, row, aggs).await?;
+                    match (op, v) {
+                        (_, Value::Null) => Value::Null,
+                        (UnOp::Not, v) => from_truth(truth(&v, "NOT")?.map(|b| !b)),
+                        (UnOp::Neg, Value::Int(i)) => {
+                            Value::Int(i.checked_neg().ok_or_else(|| data("integer overflow"))?)
+                        }
+                        (UnOp::Neg, Value::Float(f)) => Value::Float(-f),
+                        (UnOp::Pos, v @ (Value::Int(_) | Value::Float(_))) => v,
+                        (_, v) => {
+                            return Err(data(format!("unary operator on {}", v.type_name())));
+                        }
+                    }
                 }
-            },
-            Expr::Call { name, args, .. } => {
-                if is_aggregate(name) {
-                    return Err(Error::Semantic(format!("{name}() outside aggregation")));
+                Expr::Binary(op, a, b) => {
+                    let x = self.eval(a, row, aggs).await?;
+                    if matches!(op, BinOp::And | BinOp::Or | BinOp::Xor) {
+                        // Report a bad left operand before evaluating the right.
+                        truth(&x, "boolean operator")?;
+                    }
+                    let y = self.eval(b, row, aggs).await?;
+                    binary(*op, x, y)?
                 }
-                let args = args
-                    .iter()
-                    .map(|a| self.eval(a, row, aggs))
-                    .collect::<Result<Vec<_>, _>>()?;
-                call_scalar(name, args, self.store)?
-            }
+                Expr::IsNull { expr, negated } => {
+                    Value::Bool(self.eval(expr, row, aggs).await?.is_null() != *negated)
+                }
+                Expr::IsLabeled {
+                    expr,
+                    labels,
+                    negated,
+                } => match self.eval(expr, row, aggs).await? {
+                    Value::Null => Value::Null,
+                    Value::Node(n) => Value::Bool(self.node_labeled(n, labels).await != *negated),
+                    Value::Edge(r) => Value::Bool(self.edge_labeled(r, labels).await != *negated),
+                    other => {
+                        return Err(data(format!("label test on {}", other.type_name())));
+                    }
+                },
+                Expr::Call { name, args, .. } => {
+                    if is_aggregate(name) {
+                        return Err(Error::Semantic(format!("{name}() outside aggregation")));
+                    }
+                    let args = self.eval_all(args, row, aggs).await?;
+                    call_scalar(name, args, self.store).await?
+                }
+            })
         })
     }
+}
 
-    fn binary(
-        &self,
-        op: BinOp,
-        a: &Expr,
-        b: &Expr,
-        row: &Row,
-        aggs: &[Value],
-    ) -> Result<Value, Error> {
-        use BinOp::*;
-        // Boolean connectives are three-valued and check their operand types.
-        if matches!(op, And | Or | Xor) {
-            let x = truth(&self.eval(a, row, aggs)?, "boolean operator")?;
-            let y = truth(&self.eval(b, row, aggs)?, "boolean operator")?;
-            return Ok(from_truth(match op {
+/// Apply a binary operator to evaluated operands. The boolean connectives
+/// do not short-circuit, so they check both operand types.
+fn binary(op: BinOp, x: Value, y: Value) -> Result<Value, Error> {
+    use BinOp::*;
+    Ok(match op {
+        And | Or | Xor => {
+            let x = truth(&x, "boolean operator")?;
+            let y = truth(&y, "boolean operator")?;
+            from_truth(match op {
                 And => match (x, y) {
                     (Some(false), _) | (_, Some(false)) => Some(false),
                     (Some(true), Some(true)) => Some(true),
@@ -612,80 +649,75 @@ impl Ctx<'_> {
                     (Some(p), Some(q)) => Some(p != q),
                     _ => None,
                 },
-            }));
+            })
         }
-        let x = self.eval(a, row, aggs)?;
-        let y = self.eval(b, row, aggs)?;
-        Ok(match op {
-            Eq => from_truth(equals(&x, &y)),
-            Ne => from_truth(equals(&x, &y).map(|b| !b)),
-            Lt | Le | Gt | Ge => {
-                let nan = |v: &Value| matches!(v, Value::Float(f) if f.is_nan());
-                let num = |v: &Value| matches!(v, Value::Int(_) | Value::Float(_));
-                if x.is_null() || y.is_null() {
+        Eq => from_truth(equals(&x, &y)),
+        Ne => from_truth(equals(&x, &y).map(|b| !b)),
+        Lt | Le | Gt | Ge => {
+            let nan = |v: &Value| matches!(v, Value::Float(f) if f.is_nan());
+            let num = |v: &Value| matches!(v, Value::Int(_) | Value::Float(_));
+            if x.is_null() || y.is_null() {
+                Value::Null
+            } else if (nan(&x) || nan(&y)) && num(&x) && num(&y) {
+                Value::Bool(false)
+            } else {
+                from_truth(compare(&x, &y).map(|o| match op {
+                    Lt => o == Ordering::Less,
+                    Le => o != Ordering::Greater,
+                    Gt => o == Ordering::Greater,
+                    _ => o != Ordering::Less,
+                }))
+            }
+        }
+        In => match y {
+            Value::Null => Value::Null,
+            Value::List(ys) => {
+                let mut unknown = false;
+                for v in &ys {
+                    match equals(&x, v) {
+                        Some(true) => return Ok(Value::Bool(true)),
+                        None => unknown = true,
+                        Some(false) => {}
+                    }
+                }
+                if unknown {
                     Value::Null
-                } else if (nan(&x) || nan(&y)) && num(&x) && num(&y) {
-                    Value::Bool(false)
                 } else {
-                    from_truth(compare(&x, &y).map(|o| match op {
-                        Lt => o == Ordering::Less,
-                        Le => o != Ordering::Greater,
-                        Gt => o == Ordering::Greater,
-                        _ => o != Ordering::Less,
-                    }))
+                    Value::Bool(false)
                 }
             }
-            In => match y {
-                Value::Null => Value::Null,
-                Value::List(ys) => {
-                    let mut unknown = false;
-                    for v in &ys {
-                        match equals(&x, v) {
-                            Some(true) => return Ok(Value::Bool(true)),
-                            None => unknown = true,
-                            Some(false) => {}
-                        }
-                    }
-                    if unknown {
-                        Value::Null
-                    } else {
-                        Value::Bool(false)
-                    }
-                }
-                other => {
-                    return Err(data(format!(
-                        "IN expects a LIST, got {}",
-                        other.type_name()
-                    )));
-                }
-            },
-            StartsWith | EndsWith | Contains => match (&x, &y) {
-                (Value::String(s), Value::String(t)) => Value::Bool(match op {
-                    StartsWith => s.starts_with(t.as_str()),
-                    EndsWith => s.ends_with(t.as_str()),
-                    _ => s.contains(t.as_str()),
-                }),
-                _ => Value::Null,
-            },
-            Concat => match (x, y) {
-                (Value::Null, _) | (_, Value::Null) => Value::Null,
-                (Value::String(s), Value::String(t)) => Value::String(s + &t),
-                (Value::List(mut s), Value::List(t)) => {
-                    s.extend(t);
-                    Value::List(s)
-                }
-                (x, y) => {
-                    return Err(data(format!(
-                        "cannot concatenate {} and {}",
-                        x.type_name(),
-                        y.type_name()
-                    )));
-                }
-            },
-            Add | Sub | Mul | Div | Mod | Pow => arith(op, x, y)?,
-            And | Or | Xor => unreachable!(),
-        })
-    }
+            other => {
+                return Err(data(format!(
+                    "IN expects a LIST, got {}",
+                    other.type_name()
+                )));
+            }
+        },
+        StartsWith | EndsWith | Contains => match (&x, &y) {
+            (Value::String(s), Value::String(t)) => Value::Bool(match op {
+                StartsWith => s.starts_with(t.as_str()),
+                EndsWith => s.ends_with(t.as_str()),
+                _ => s.contains(t.as_str()),
+            }),
+            _ => Value::Null,
+        },
+        Concat => match (x, y) {
+            (Value::Null, _) | (_, Value::Null) => Value::Null,
+            (Value::String(s), Value::String(t)) => Value::String(s + &t),
+            (Value::List(mut s), Value::List(t)) => {
+                s.extend(t);
+                Value::List(s)
+            }
+            (x, y) => {
+                return Err(data(format!(
+                    "cannot concatenate {} and {}",
+                    x.type_name(),
+                    y.type_name()
+                )));
+            }
+        },
+        Add | Sub | Mul | Div | Mod | Pow => arith(op, x, y)?,
+    })
 }
 
 pub(crate) fn arith(op: BinOp, x: Value, y: Value) -> Result<Value, Error> {
@@ -748,15 +780,15 @@ struct Matcher<'a, 'c> {
 }
 
 impl Matcher<'_, '_> {
-    fn props_ok(
+    async fn props_ok(
         &self,
         props: &[(String, Expr)],
         row: &Row,
-        get: &dyn Fn(&str) -> Option<Value>,
+        el: Element,
     ) -> Result<bool, Error> {
         for (k, e) in props {
-            let want = self.ctx.eval(e, row, &[])?;
-            let have = get(k).unwrap_or(Value::Null);
+            let want = self.ctx.eval(e, row, &[]).await?;
+            let have = self.ctx.property(el, k).await;
             if equals(&have, &want) != Some(true) {
                 return Ok(false);
             }
@@ -765,9 +797,14 @@ impl Matcher<'_, '_> {
     }
 
     /// Try to bind `np` to `node`; returns the extended row on success.
-    fn bind_node(&self, np: &NodePattern, node: NodeId, row: &Row) -> Result<Option<Row>, Error> {
+    async fn bind_node(
+        &self,
+        np: &NodePattern,
+        node: NodeId,
+        row: &Row,
+    ) -> Result<Option<Row>, Error> {
         if let Some(l) = &np.labels
-            && !self.ctx.node_labeled(node, l)
+            && !self.ctx.node_labeled(node, l).await
         {
             return Ok(None);
         }
@@ -781,26 +818,24 @@ impl Matcher<'_, '_> {
                 }
             }
         }
-        let store = self.ctx.store;
-        if !self.props_ok(&np.props, &row, &|k| store.node_property(node, k))? {
+        if !self.props_ok(&np.props, &row, Element::Node(node)).await? {
             return Ok(None);
         }
         if let Some(w) = &np.where_
-            && truth(&self.ctx.eval(w, &row, &[])?, "WHERE")? != Some(true)
+            && truth(&self.ctx.eval(w, &row, &[]).await?, "WHERE")? != Some(true)
         {
             return Ok(None);
         }
         Ok(Some(row))
     }
 
-    fn edge_ok(&self, ep: &EdgePattern, edge: EdgeId, row: &Row) -> Result<bool, Error> {
+    async fn edge_ok(&self, ep: &EdgePattern, edge: EdgeId, row: &Row) -> Result<bool, Error> {
         if let Some(l) = &ep.labels
-            && !self.ctx.edge_labeled(edge, l)
+            && !self.ctx.edge_labeled(edge, l).await
         {
             return Ok(false);
         }
-        let store = self.ctx.store;
-        if !self.props_ok(&ep.props, row, &|k| store.edge_property(edge, k))? {
+        if !self.props_ok(&ep.props, row, Element::Edge(edge)).await? {
             return Ok(false);
         }
         if let Some(w) = &ep.where_ {
@@ -808,7 +843,7 @@ impl Matcher<'_, '_> {
             if let Some(v) = &ep.var {
                 row.insert(v.clone(), Value::Edge(edge));
             }
-            if truth(&self.ctx.eval(w, &row, &[])?, "WHERE")? != Some(true) {
+            if truth(&self.ctx.eval(w, &row, &[]).await?, "WHERE")? != Some(true) {
                 return Ok(false);
             }
         }
@@ -816,137 +851,153 @@ impl Matcher<'_, '_> {
     }
 
     /// Incident edges in pattern direction, as (edge, far endpoint).
-    fn steps_from(&self, node: NodeId, dir: Direction) -> Vec<(EdgeId, NodeId)> {
+    async fn steps_from(&self, node: NodeId, dir: Direction) -> Vec<(EdgeId, NodeId)> {
         let s = self.ctx.store;
-        let out = || s.edges(node, Incidence::Outgoing).map(|e| (e.id, e.target));
-        let inc = || s.edges(node, Incidence::Incoming).map(|e| (e.id, e.source));
+        let out = || async { s.edges(node, Incidence::Outgoing).await };
+        let inc = || async { s.edges(node, Incidence::Incoming).await };
         match dir {
-            Direction::Right => out().collect(),
-            Direction::Left => inc().collect(),
+            Direction::Right => out().await.iter().map(|e| (e.id, e.target)).collect(),
+            Direction::Left => inc().await.iter().map(|e| (e.id, e.source)).collect(),
             // A self-loop is one edge, not two traversals.
-            Direction::Any => out()
-                .chain(
-                    s.edges(node, Incidence::Incoming)
+            Direction::Any => {
+                let mut v: Vec<_> = out().await.iter().map(|e| (e.id, e.target)).collect();
+                v.extend(
+                    inc()
+                        .await
+                        .iter()
                         .filter(|e| e.source != e.target)
                         .map(|e| (e.id, e.source)),
-                )
-                .collect(),
-        }
-    }
-
-    fn run(&mut self, row: Row) -> Result<(), Error> {
-        self.pattern(0, row)
-    }
-
-    fn pattern(&mut self, pi: usize, row: Row) -> Result<(), Error> {
-        let Some(p) = self.patterns.get(pi) else {
-            self.out.push(row);
-            return Ok(());
-        };
-        let candidates: Vec<NodeId> = match p.start.var.as_ref().and_then(|v| row.get(v)) {
-            Some(Value::Node(n)) => vec![*n],
-            Some(_) => vec![],
-            None => match p.start.labels.as_ref().and_then(required_label) {
-                Some(l) => self.ctx.store.nodes_with_label(l).collect(),
-                None => self.ctx.store.nodes().collect(),
-            },
-        };
-        for n in candidates {
-            if let Some(r) = self.bind_node(&p.start, n, &row)? {
-                self.step(pi, 0, n, r)?;
+                );
+                v
             }
         }
-        Ok(())
     }
 
-    fn step(&mut self, pi: usize, si: usize, cur: NodeId, row: Row) -> Result<(), Error> {
-        let p = &self.patterns[pi];
-        let Some((ep, np)) = p.steps.get(si) else {
-            return self.pattern(pi + 1, row);
-        };
-        match ep.quantifier {
-            None => {
-                for (edge, far) in self.steps_from(cur, ep.direction) {
-                    if self.used.contains(&edge) || !self.edge_ok(ep, edge, &row)? {
-                        continue;
-                    }
-                    let mut r = row.clone();
-                    if let Some(v) = &ep.var {
-                        match r.get(v) {
-                            Some(Value::Edge(e)) if *e == edge => {}
-                            Some(_) => continue,
-                            None => {
-                                r.insert(v.clone(), Value::Edge(edge));
+    async fn run(&mut self, row: Row) -> Result<(), Error> {
+        self.pattern(0, row).await
+    }
+
+    fn pattern(&mut self, pi: usize, row: Row) -> BoxFuture<'_, Result<(), Error>> {
+        Box::pin(async move {
+            let Some(p) = self.patterns.get(pi) else {
+                self.out.push(row);
+                return Ok(());
+            };
+            let candidates: Vec<NodeId> = match p.start.var.as_ref().and_then(|v| row.get(v)) {
+                Some(Value::Node(n)) => vec![*n],
+                Some(_) => vec![],
+                None => match p.start.labels.as_ref().and_then(required_label) {
+                    Some(l) => self.ctx.store.nodes_with_label(l).await,
+                    None => self.ctx.store.nodes().await,
+                },
+            };
+            for n in candidates {
+                if let Some(r) = self.bind_node(&p.start, n, &row).await? {
+                    self.step(pi, 0, n, r).await?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn step(
+        &mut self,
+        pi: usize,
+        si: usize,
+        cur: NodeId,
+        row: Row,
+    ) -> BoxFuture<'_, Result<(), Error>> {
+        Box::pin(async move {
+            let p = &self.patterns[pi];
+            let Some((ep, np)) = p.steps.get(si) else {
+                return self.pattern(pi + 1, row).await;
+            };
+            match ep.quantifier {
+                None => {
+                    for (edge, far) in self.steps_from(cur, ep.direction).await {
+                        if self.used.contains(&edge) || !self.edge_ok(ep, edge, &row).await? {
+                            continue;
+                        }
+                        let mut r = row.clone();
+                        if let Some(v) = &ep.var {
+                            match r.get(v) {
+                                Some(Value::Edge(e)) if *e == edge => {}
+                                Some(_) => continue,
+                                None => {
+                                    r.insert(v.clone(), Value::Edge(edge));
+                                }
                             }
                         }
+                        if let Some(r) = self.bind_node(np, far, &r).await? {
+                            self.used.insert(edge);
+                            self.step(pi, si + 1, far, r).await?;
+                            self.used.remove(&edge);
+                        }
                     }
-                    if let Some(r) = self.bind_node(np, far, &r)? {
-                        self.used.insert(edge);
-                        self.step(pi, si + 1, far, r)?;
-                        self.used.remove(&edge);
-                    }
+                    Ok(())
                 }
-                Ok(())
+                Some(q) => {
+                    let mut trail = Vec::new();
+                    self.quantified(pi, si, q, cur, &row, &mut trail).await
+                }
             }
-            Some(q) => {
-                let mut trail = Vec::new();
-                self.quantified(pi, si, q, cur, &row, &mut trail)
-            }
-        }
+        })
     }
 
-    fn quantified(
-        &mut self,
+    fn quantified<'s>(
+        &'s mut self,
         pi: usize,
         si: usize,
         q: Quantifier,
         cur: NodeId,
-        row: &Row,
-        trail: &mut Vec<EdgeId>,
-    ) -> Result<(), Error> {
-        let (ep, np) = &self.patterns[pi].steps[si];
-        let depth = trail.len() as u32;
-        if depth >= q.min {
-            let mut r = row.clone();
-            let ok = match &ep.var {
-                None => true,
-                Some(v) => {
-                    let list = Value::List(trail.iter().map(|e| Value::Edge(*e)).collect());
-                    match r.get(v) {
-                        Some(bound) => equivalent(bound, &list),
-                        None => {
-                            r.insert(v.clone(), list);
-                            true
+        row: &'s Row,
+        trail: &'s mut Vec<EdgeId>,
+    ) -> BoxFuture<'s, Result<(), Error>> {
+        Box::pin(async move {
+            let (ep, np) = &self.patterns[pi].steps[si];
+            let depth = trail.len() as u32;
+            if depth >= q.min {
+                let mut r = row.clone();
+                let ok = match &ep.var {
+                    None => true,
+                    Some(v) => {
+                        let list = Value::List(trail.iter().map(|e| Value::Edge(*e)).collect());
+                        match r.get(v) {
+                            Some(bound) => equivalent(bound, &list),
+                            None => {
+                                r.insert(v.clone(), list);
+                                true
+                            }
                         }
                     }
+                };
+                if ok && let Some(r) = self.bind_node(np, cur, &r).await? {
+                    self.step(pi, si + 1, cur, r).await?;
                 }
-            };
-            if ok && let Some(r) = self.bind_node(np, cur, &r)? {
-                self.step(pi, si + 1, cur, r)?;
             }
-        }
-        if q.max.is_some_and(|m| depth >= m) {
-            return Ok(());
-        }
-        for (edge, far) in self.steps_from(cur, ep.direction) {
-            if self.used.contains(&edge) {
-                continue;
+            if q.max.is_some_and(|m| depth >= m) {
+                return Ok(());
             }
-            // Per-iteration constraints see the edge variable as a singleton.
-            let mut local = row.clone();
-            if let Some(v) = &ep.var {
-                local.remove(v);
+            for (edge, far) in self.steps_from(cur, ep.direction).await {
+                if self.used.contains(&edge) {
+                    continue;
+                }
+                // Per-iteration constraints see the edge variable as a singleton.
+                let mut local = row.clone();
+                if let Some(v) = &ep.var {
+                    local.remove(v);
+                }
+                if !self.edge_ok(ep, edge, &local).await? {
+                    continue;
+                }
+                self.used.insert(edge);
+                trail.push(edge);
+                self.quantified(pi, si, q, far, row, trail).await?;
+                trail.pop();
+                self.used.remove(&edge);
             }
-            if !self.edge_ok(ep, edge, &local)? {
-                continue;
-            }
-            self.used.insert(edge);
-            trail.push(edge);
-            self.quantified(pi, si, q, far, row, trail)?;
-            trail.pop();
-            self.used.remove(&edge);
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -1003,7 +1054,7 @@ fn extract_aggs(e: &Expr, aggs: &mut Vec<Expr>) -> Expr {
     }
 }
 
-fn compute_agg(ctx: &Ctx, agg: &Expr, rows: &[&Row]) -> Result<Value, Error> {
+async fn compute_agg(ctx: &Ctx<'_>, agg: &Expr, rows: &[&Row]) -> Result<Value, Error> {
     let (name, distinct, arg) = match agg {
         Expr::CountStar => return Ok(Value::Int(rows.len() as i64)),
         Expr::Call {
@@ -1015,7 +1066,7 @@ fn compute_agg(ctx: &Ctx, agg: &Expr, rows: &[&Row]) -> Result<Value, Error> {
     };
     let mut vals: Vec<Value> = Vec::new();
     for r in rows {
-        let v = ctx.eval(arg, r, &[])?;
+        let v = ctx.eval(arg, r, &[]).await?;
         if v.is_null() || (distinct && vals.iter().any(|x| equivalent(x, &v))) {
             continue;
         }
@@ -1054,9 +1105,13 @@ fn acc_float(v: Value) -> Value {
     }
 }
 
-fn non_negative_int(ctx: &Ctx, e: &Option<Expr>, what: &str) -> Result<Option<usize>, Error> {
+async fn non_negative_int(
+    ctx: &Ctx<'_>,
+    e: &Option<Expr>,
+    what: &str,
+) -> Result<Option<usize>, Error> {
     let Some(e) = e else { return Ok(None) };
-    match ctx.eval(e, &Row::new(), &[])? {
+    match ctx.eval(e, &Row::new(), &[]).await? {
         Value::Int(i) if i >= 0 => Ok(Some(i as usize)),
         other => Err(data(format!(
             "{what} expects a non-negative INTEGER, got {other}"
@@ -1064,8 +1119,8 @@ fn non_negative_int(ctx: &Ctx, e: &Option<Expr>, what: &str) -> Result<Option<us
     }
 }
 
-fn project(
-    ctx: &Ctx,
+async fn project(
+    ctx: &Ctx<'_>,
     ret: &Return,
     rows: Vec<Row>,
     in_scope: &[String],
@@ -1107,10 +1162,10 @@ fn project(
 
         let mut groups: Vec<(Vec<Value>, Vec<&Row>)> = Vec::new();
         for r in &rows {
-            let key = key_idx
-                .iter()
-                .map(|&i| ctx.eval(&items[i].expr, r, &[]))
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut key = Vec::with_capacity(key_idx.len());
+            for &i in &key_idx {
+                key.push(ctx.eval(&items[i].expr, r, &[]).await?);
+            }
             match groups
                 .iter_mut()
                 .find(|(k, _)| k.iter().zip(&key).all(|(a, b)| equivalent(a, b)))
@@ -1123,10 +1178,10 @@ fn project(
             groups.push((Vec::new(), Vec::new()));
         }
         for (key, members) in groups {
-            let aggs = agg_exprs
-                .iter()
-                .map(|a| compute_agg(ctx, a, &members))
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut aggs = Vec::with_capacity(agg_exprs.len());
+            for a in &agg_exprs {
+                aggs.push(compute_agg(ctx, a, &members).await?);
+            }
             // Scope: grouping keys by their own expression + aliases.
             let mut scope = members.first().map(|r| (*r).clone()).unwrap_or_default();
             let mut vals = Vec::with_capacity(items.len());
@@ -1135,7 +1190,7 @@ fn project(
                 let v = if key_idx.contains(&i) {
                     k.next().unwrap()
                 } else {
-                    ctx.eval(expr, &scope, &aggs)?
+                    ctx.eval(expr, &scope, &aggs).await?
                 };
                 vals.push(v);
             }
@@ -1145,15 +1200,15 @@ fn project(
             out.push((vals, scope, aggs));
         }
         let mut sorted = out;
-        sort_records(ctx, ret, &items, &order_rewritten, &mut sorted)?;
-        return finish(ctx, ret, columns, sorted);
+        sort_records(ctx, ret, &items, &order_rewritten, &mut sorted).await?;
+        return finish(ctx, ret, columns, sorted).await;
     }
 
     for r in rows {
-        let vals = items
-            .iter()
-            .map(|it| ctx.eval(&it.expr, &r, &[]))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut vals = Vec::with_capacity(items.len());
+        for it in &items {
+            vals.push(ctx.eval(&it.expr, &r, &[]).await?);
+        }
         let mut scope = r;
         for (it, v) in items.iter().zip(&vals) {
             scope.insert(it.column_name().to_string(), v.clone());
@@ -1173,12 +1228,12 @@ fn project(
         out = seen;
     }
     let order: Vec<Expr> = ret.order_by.iter().map(|s| s.expr.clone()).collect();
-    sort_records(ctx, ret, &items, &order, &mut out)?;
-    finish(ctx, ret, columns, out)
+    sort_records(ctx, ret, &items, &order, &mut out).await?;
+    finish(ctx, ret, columns, out).await
 }
 
-fn sort_records(
-    ctx: &Ctx,
+async fn sort_records(
+    ctx: &Ctx<'_>,
     ret: &Return,
     items: &[ReturnItem],
     order: &[Expr],
@@ -1194,7 +1249,7 @@ fn sort_records(
             // An ORDER BY expression identical to a projected one sorts by that column.
             let v = match items.iter().position(|i| i.expr == s.expr) {
                 Some(i) => rec.0[i].clone(),
-                None => ctx.eval(e, &rec.1, &rec.2)?,
+                None => ctx.eval(e, &rec.1, &rec.2).await?,
             };
             keys.push(v);
         }
@@ -1214,8 +1269,8 @@ fn sort_records(
     Ok(())
 }
 
-fn finish(
-    ctx: &Ctx,
+async fn finish(
+    ctx: &Ctx<'_>,
     ret: &Return,
     columns: Vec<String>,
     recs: Vec<(Vec<Value>, Row, Vec<Value>)>,
@@ -1234,8 +1289,10 @@ fn finish(
         }
         rows = seen;
     }
-    let offset = non_negative_int(ctx, &ret.offset, "OFFSET")?.unwrap_or(0);
-    let limit = non_negative_int(ctx, &ret.limit, "LIMIT")?;
+    let offset = non_negative_int(ctx, &ret.offset, "OFFSET")
+        .await?
+        .unwrap_or(0);
+    let limit = non_negative_int(ctx, &ret.limit, "LIMIT").await?;
     let rows = rows
         .into_iter()
         .skip(offset)
@@ -1245,7 +1302,11 @@ fn finish(
 }
 
 /// Check and evaluate a parsed query.
-pub fn execute(store: &dyn GraphStore, q: &Query, params: &Params) -> Result<QueryResult, Error> {
+pub async fn execute(
+    store: &dyn GraphStore,
+    q: &Query,
+    params: &Params,
+) -> Result<QueryResult, Error> {
     check(q, params)?;
     let ctx = Ctx { store, params };
     let mut rows = vec![Row::new()];
@@ -1261,11 +1322,11 @@ pub fn execute(store: &dyn GraphStore, q: &Query, params: &Params) -> Result<Que
                         used: HashSet::new(),
                         out: Vec::new(),
                     };
-                    matcher.run(row)?;
+                    matcher.run(row).await?;
                     for r in matcher.out {
                         let keep = match &m.where_ {
                             None => true,
-                            Some(w) => truth(&ctx.eval(w, &r, &[])?, "WHERE")? == Some(true),
+                            Some(w) => truth(&ctx.eval(w, &r, &[]).await?, "WHERE")? == Some(true),
                         };
                         if keep {
                             next.push(r);
@@ -1286,7 +1347,7 @@ pub fn execute(store: &dyn GraphStore, q: &Query, params: &Params) -> Result<Que
             Clause::Filter(cond) => {
                 let mut next = Vec::new();
                 for r in rows {
-                    if truth(&ctx.eval(cond, &r, &[])?, "FILTER")? == Some(true) {
+                    if truth(&ctx.eval(cond, &r, &[]).await?, "FILTER")? == Some(true) {
                         next.push(r);
                     }
                 }
@@ -1295,7 +1356,7 @@ pub fn execute(store: &dyn GraphStore, q: &Query, params: &Params) -> Result<Que
             Clause::For { var, list } => {
                 let mut next = Vec::new();
                 for row in rows {
-                    let items = match ctx.eval(list, &row, &[])? {
+                    let items = match ctx.eval(list, &row, &[]).await? {
                         Value::Null => Vec::new(),
                         Value::List(xs) => xs,
                         other => vec![other],
@@ -1311,5 +1372,5 @@ pub fn execute(store: &dyn GraphStore, q: &Query, params: &Params) -> Result<Que
             }
         }
     }
-    project(&ctx, &q.ret, rows, &in_scope)
+    project(&ctx, &q.ret, rows, &in_scope).await
 }
