@@ -78,7 +78,10 @@ Every method returns a `StoreResult`, so a backend reports failures instead
 of panicking. Wrap the backend's own error in a `StoreError` with a kind:
 `NotFound` (an unknown id), `Unavailable` (unreachable, timed out or busy,
 so a retry may succeed), `Corrupt` or `Other`. The original error stays
-reachable through `source()`. Queries return the failure as `Error::Store`,
+reachable through `source()`. Every method that takes an id must answer an
+id it does not hold with `NotFound`, never an empty result, so a bare
+element stays distinguishable from a missing one. `tests/store_errors.rs`
+checks this contract against each backend. Queries return the failure as `Error::Store`,
 and `load_spec`/`apply_overlay` return it as `SpecError::Store`.
 
 ```rust

@@ -1,4 +1,5 @@
-//! Storage failures reach the caller as errors, never panics. `Remote` is
+//! Storage failures reach the caller as errors, never panics, and every
+//! backend reports an unknown id as `NotFound`. `Remote` is
 //! shaped like a network-backed store: it implements the traits the way an
 //! external backend would, and its "network" can drop after a number of
 //! calls.
@@ -179,20 +180,103 @@ fn loaders_report_store_errors() {
     }
 }
 
-#[test]
-fn unknown_ids_are_not_found() {
-    let mut g = PetgraphStore::new();
-    let a = block_on(g.add_node(vec![], BTreeMap::new())).unwrap();
-    let ghost = NodeId(42);
-    let not_found = |r: StoreResult<()>| {
-        assert_eq!(r.unwrap_err().kind(), StoreErrorKind::NotFound);
+/// The `GraphStore` id contract, for any backend: an element that exists
+/// with no labels, properties or edges answers with empty results, and an id
+/// the store does not hold answers `NotFound` from every method, including
+/// when it reaches a query as a parameter.
+async fn checks_ids(g: &mut dyn GraphStoreMut) {
+    let a = g.add_node(vec![], BTreeMap::new()).await.unwrap();
+    let b = g.add_node(vec![], BTreeMap::new()).await.unwrap();
+    let e = g.add_edge(a, b, vec![], BTreeMap::new()).await.unwrap();
+
+    // Bare elements exist: empty answers, not errors.
+    assert!(g.node_labels(b).await.unwrap().is_empty());
+    assert!(!g.node_has_label(b, "X").await.unwrap());
+    assert_eq!(g.node_property(b, "k").await.unwrap(), None);
+    assert!(g.node_properties(b).await.unwrap().is_empty());
+    assert!(g.edges(b, Incidence::Outgoing).await.unwrap().is_empty());
+    assert_eq!(g.edges(b, Incidence::Incoming).await.unwrap().len(), 1);
+    assert_eq!(g.edge(e).await.unwrap().target, b);
+    assert!(g.edge_labels(e).await.unwrap().is_empty());
+    assert!(!g.edge_has_label(e, "R").await.unwrap());
+    assert_eq!(g.edge_property(e, "k").await.unwrap(), None);
+    assert!(g.edge_properties(e).await.unwrap().is_empty());
+    g.set_node_property(b, "k", Value::Null).await.unwrap();
+
+    // Unknown ids: NotFound from every method.
+    let (ghost, ghost_edge) = (NodeId(42), EdgeId(42));
+    let not_found = |what: &str, r: StoreResult<()>| match r {
+        Err(err) => assert_eq!(err.kind(), StoreErrorKind::NotFound, "{what}: {err}"),
+        Ok(()) => panic!("{what}: unknown id answered Ok"),
     };
-    not_found(block_on(g.node_labels(ghost)).map(drop));
-    not_found(block_on(g.node_property(ghost, "k")).map(drop));
-    not_found(block_on(g.edges(ghost, Incidence::Outgoing)).map(drop));
-    not_found(block_on(g.edge(EdgeId(7))).map(drop));
-    not_found(block_on(g.edge_labels(EdgeId(7))).map(drop));
-    not_found(block_on(g.add_edge(a, ghost, vec!["R".into()], BTreeMap::new())).map(drop));
-    not_found(block_on(g.set_node_property(ghost, "k", Value::Int(1))));
-    assert_eq!(g.edge_count(), 0);
+    not_found("node_labels", g.node_labels(ghost).await.map(drop));
+    not_found(
+        "node_has_label",
+        g.node_has_label(ghost, "X").await.map(drop),
+    );
+    not_found("node_property", g.node_property(ghost, "k").await.map(drop));
+    not_found("node_properties", g.node_properties(ghost).await.map(drop));
+    for inc in [Incidence::Outgoing, Incidence::Incoming] {
+        not_found("edges", g.edges(ghost, inc).await.map(drop));
+    }
+    not_found("edge", g.edge(ghost_edge).await.map(drop));
+    not_found("edge_labels", g.edge_labels(ghost_edge).await.map(drop));
+    not_found(
+        "edge_has_label",
+        g.edge_has_label(ghost_edge, "R").await.map(drop),
+    );
+    not_found(
+        "edge_property",
+        g.edge_property(ghost_edge, "k").await.map(drop),
+    );
+    not_found(
+        "edge_properties",
+        g.edge_properties(ghost_edge).await.map(drop),
+    );
+    let add = g
+        .add_edge(a, ghost, vec!["R".into()], BTreeMap::new())
+        .await;
+    not_found("add_edge", add.map(drop));
+    not_found("set", g.set_node_property(ghost, "k", Value::Int(1)).await);
+    not_found("remove", g.set_node_property(ghost, "k", Value::Null).await);
+
+    // Through query parameters: an error, not a null.
+    let params = Params::from([
+        ("n".to_string(), Value::Node(ghost)),
+        ("r".to_string(), Value::Edge(ghost_edge)),
+    ]);
+    for q in [
+        "RETURN $n.k",
+        "RETURN $n['k']",
+        "RETURN labels($n)",
+        "RETURN $n IS LABELED X",
+        "RETURN $r.k",
+        "RETURN type($r)",
+    ] {
+        match query(&*g, q, &params).await {
+            Err(Error::Store(err)) => assert_eq!(err.kind(), StoreErrorKind::NotFound, "{q}"),
+            other => panic!("{q}: expected NotFound, got {other:?}"),
+        }
+    }
+
+    // Nothing above changed the graph.
+    assert_eq!(g.nodes().await.unwrap(), [a, b]);
+    assert!(g.edges(a, Incidence::Outgoing).await.unwrap().len() == 1);
+}
+
+#[test]
+fn petgraph_checks_ids() {
+    block_on(checks_ids(&mut PetgraphStore::new()));
+}
+
+#[test]
+fn remote_checks_ids() {
+    block_on(checks_ids(&mut Remote::new(usize::MAX)));
+}
+
+#[cfg(feature = "turso")]
+#[test]
+fn turso_checks_ids() {
+    let mut g = block_on(slcr_gql::TursoStore::in_memory()).unwrap();
+    block_on(checks_ids(&mut g));
 }

@@ -176,10 +176,11 @@ impl FromStr for TursoLocation {
 /// Database failures surface as [`StoreError`]s: a busy or locked database,
 /// an interrupted statement or an I/O failure as
 /// [`Unavailable`](StoreErrorKind::Unavailable), a corrupt file or
-/// undecodable value as [`Corrupt`](StoreErrorKind::Corrupt), and a mutation
-/// that references an unknown node or edge as
-/// [`NotFound`](StoreErrorKind::NotFound). Reads of an unknown id return
-/// nothing rather than an error, except [`edge`](GraphStore::edge).
+/// undecodable value as [`Corrupt`](StoreErrorKind::Corrupt), and any read or
+/// mutation of an unknown node or edge id as
+/// [`NotFound`](StoreErrorKind::NotFound). Each read checks the id in the
+/// same statement that fetches the data, so an element that exists without
+/// labels or properties is never confused with one that does not exist.
 ///
 /// Mutations outside [`transaction`](Self::transaction) commit one element
 /// at a time, which costs a disk sync per element for a file database; load
@@ -404,28 +405,67 @@ impl TursoStore {
             .collect()
     }
 
-    async fn strings(&self, sql: &str, params: impl IntoParams + Send) -> StoreResult<Vec<String>> {
-        self.rows(sql, params)
+    /// Rows of a query about one element: the node or edge (`owner`) with
+    /// id `id`. The query is `gql_{owner}s LEFT JOIN` its data, so no rows
+    /// means the element does not exist, and a row whose first column is
+    /// NULL means it exists without matching data; that row is dropped.
+    async fn owned(
+        &self,
+        owner: &str,
+        id: u64,
+        sql: &str,
+        params: impl IntoParams + Send,
+    ) -> StoreResult<Vec<Row>> {
+        let rows = self.rows(sql, params).await?;
+        if rows.is_empty() {
+            return Err(not_found(owner, id));
+        }
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            if !matches!(column(&row, 0)?, turso::Value::Null) {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn owned_strings(&self, owner: &str, id: u64, sql: &str) -> StoreResult<Vec<String>> {
+        self.owned(owner, id, sql, (id as i64,))
             .await?
             .iter()
             .map(|r| text(r, 0))
             .collect()
     }
 
-    async fn exists(&self, sql: &str, params: impl IntoParams + Send) -> StoreResult<bool> {
-        Ok(!self.rows(sql, params).await?.is_empty())
+    async fn owned_flag(&self, owner: &str, id: u64, sql: &str, arg: &str) -> StoreResult<bool> {
+        let rows = self.owned(owner, id, sql, (id as i64, arg)).await?;
+        let row = rows
+            .first()
+            .ok_or_else(|| corrupt("EXISTS returned NULL"))?;
+        Ok(int(row, 0)? != 0)
     }
 
-    async fn property(&self, sql: &str, id: u64, key: &str) -> StoreResult<Option<Value>> {
-        self.rows(sql, (id as i64, key))
+    async fn owned_property(
+        &self,
+        owner: &str,
+        id: u64,
+        sql: &str,
+        key: &str,
+    ) -> StoreResult<Option<Value>> {
+        self.owned(owner, id, sql, (id as i64, key))
             .await?
             .first()
             .map(|r| decode_property(r, 0))
             .transpose()
     }
 
-    async fn properties(&self, sql: &str, id: u64) -> StoreResult<BTreeMap<String, Value>> {
-        self.rows(sql, (id as i64,))
+    async fn owned_properties(
+        &self,
+        owner: &str,
+        id: u64,
+        sql: &str,
+    ) -> StoreResult<BTreeMap<String, Value>> {
+        self.owned(owner, id, sql, (id as i64,))
             .await?
             .iter()
             .map(|r| Ok((text(r, 0)?, decode_property(r, 1)?)))
@@ -520,34 +560,46 @@ impl GraphStore for TursoStore {
     }
 
     async fn node_labels(&self, node: NodeId) -> StoreResult<Vec<String>> {
-        self.strings(
-            "SELECT label FROM gql_node_labels WHERE node = ?1 ORDER BY label",
-            (node.0 as i64,),
+        self.owned_strings(
+            "node",
+            node.0,
+            "SELECT l.label FROM gql_nodes n \
+             LEFT JOIN gql_node_labels l ON l.node = n.id \
+             WHERE n.id = ?1 ORDER BY l.label",
         )
         .await
     }
 
     async fn node_has_label(&self, node: NodeId, label: &str) -> StoreResult<bool> {
-        self.exists(
-            "SELECT 1 FROM gql_node_labels WHERE node = ?1 AND label = ?2",
-            (node.0 as i64, label),
+        self.owned_flag(
+            "node",
+            node.0,
+            "SELECT EXISTS (SELECT 1 FROM gql_node_labels l WHERE l.node = n.id AND l.label = ?2) \
+             FROM gql_nodes n WHERE n.id = ?1",
+            label,
         )
         .await
     }
 
     async fn node_property(&self, node: NodeId, key: &str) -> StoreResult<Option<Value>> {
-        self.property(
-            "SELECT kind, value FROM gql_node_props WHERE node = ?1 AND key = ?2",
+        self.owned_property(
+            "node",
             node.0,
+            "SELECT p.kind, p.value FROM gql_nodes n \
+             LEFT JOIN gql_node_props p ON p.node = n.id AND p.key = ?2 \
+             WHERE n.id = ?1",
             key,
         )
         .await
     }
 
     async fn node_properties(&self, node: NodeId) -> StoreResult<BTreeMap<String, Value>> {
-        self.properties(
-            "SELECT key, kind, value FROM gql_node_props WHERE node = ?1",
+        self.owned_properties(
+            "node",
             node.0,
+            "SELECT p.key, p.kind, p.value FROM gql_nodes n \
+             LEFT JOIN gql_node_props p ON p.node = n.id \
+             WHERE n.id = ?1",
         )
         .await
     }
@@ -555,13 +607,17 @@ impl GraphStore for TursoStore {
     async fn edges(&self, node: NodeId, incidence: Incidence) -> StoreResult<Vec<EdgeRef>> {
         let sql = match incidence {
             Incidence::Outgoing => {
-                "SELECT id, source, target FROM gql_edges WHERE source = ?1 ORDER BY id"
+                "SELECT e.id, e.source, e.target FROM gql_nodes n \
+                 LEFT JOIN gql_edges e ON e.source = n.id \
+                 WHERE n.id = ?1 ORDER BY e.id"
             }
             Incidence::Incoming => {
-                "SELECT id, source, target FROM gql_edges WHERE target = ?1 ORDER BY id"
+                "SELECT e.id, e.source, e.target FROM gql_nodes n \
+                 LEFT JOIN gql_edges e ON e.target = n.id \
+                 WHERE n.id = ?1 ORDER BY e.id"
             }
         };
-        self.rows(sql, (node.0 as i64,))
+        self.owned("node", node.0, sql, (node.0 as i64,))
             .await?
             .iter()
             .map(edge_ref)
@@ -570,49 +626,57 @@ impl GraphStore for TursoStore {
 
     async fn edge(&self, edge: EdgeId) -> StoreResult<EdgeRef> {
         let rows = self
-            .rows(
+            .owned(
+                "edge",
+                edge.0,
                 "SELECT id, source, target FROM gql_edges WHERE id = ?1",
                 (edge.0 as i64,),
             )
             .await?;
-        let row = rows.first().ok_or_else(|| {
-            StoreError::new(
-                StoreErrorKind::NotFound,
-                format!("no edge with id {}", edge.0),
-            )
-        })?;
-        edge_ref(row)
+        edge_ref(rows.first().ok_or_else(|| not_found("edge", edge.0))?)
     }
 
     async fn edge_labels(&self, edge: EdgeId) -> StoreResult<Vec<String>> {
-        self.strings(
-            "SELECT label FROM gql_edge_labels WHERE edge = ?1 ORDER BY label",
-            (edge.0 as i64,),
+        self.owned_strings(
+            "edge",
+            edge.0,
+            "SELECT l.label FROM gql_edges e \
+             LEFT JOIN gql_edge_labels l ON l.edge = e.id \
+             WHERE e.id = ?1 ORDER BY l.label",
         )
         .await
     }
 
     async fn edge_has_label(&self, edge: EdgeId, label: &str) -> StoreResult<bool> {
-        self.exists(
-            "SELECT 1 FROM gql_edge_labels WHERE edge = ?1 AND label = ?2",
-            (edge.0 as i64, label),
+        self.owned_flag(
+            "edge",
+            edge.0,
+            "SELECT EXISTS (SELECT 1 FROM gql_edge_labels l WHERE l.edge = e.id AND l.label = ?2) \
+             FROM gql_edges e WHERE e.id = ?1",
+            label,
         )
         .await
     }
 
     async fn edge_property(&self, edge: EdgeId, key: &str) -> StoreResult<Option<Value>> {
-        self.property(
-            "SELECT kind, value FROM gql_edge_props WHERE edge = ?1 AND key = ?2",
+        self.owned_property(
+            "edge",
             edge.0,
+            "SELECT p.kind, p.value FROM gql_edges e \
+             LEFT JOIN gql_edge_props p ON p.edge = e.id AND p.key = ?2 \
+             WHERE e.id = ?1",
             key,
         )
         .await
     }
 
     async fn edge_properties(&self, edge: EdgeId) -> StoreResult<BTreeMap<String, Value>> {
-        self.properties(
-            "SELECT key, kind, value FROM gql_edge_props WHERE edge = ?1",
+        self.owned_properties(
+            "edge",
             edge.0,
+            "SELECT p.key, p.kind, p.value FROM gql_edges e \
+             LEFT JOIN gql_edge_props p ON p.edge = e.id \
+             WHERE e.id = ?1",
         )
         .await
     }
@@ -662,11 +726,23 @@ impl GraphStoreMut for TursoStore {
         value: Value,
     ) -> StoreResult<()> {
         match encode_property(&value) {
+            // Removing a property of an unknown node is NotFound, as setting
+            // one is (through the foreign key).
             None => {
-                self.exec(
-                    "DELETE FROM gql_node_props WHERE node = ?1 AND key = ?2",
-                    (node.0 as i64, key),
-                )
+                self.atomically(async || {
+                    self.owned(
+                        "node",
+                        node.0,
+                        "SELECT id FROM gql_nodes WHERE id = ?1",
+                        (node.0 as i64,),
+                    )
+                    .await?;
+                    self.exec(
+                        "DELETE FROM gql_node_props WHERE node = ?1 AND key = ?2",
+                        (node.0 as i64, key),
+                    )
+                    .await
+                })
                 .await
             }
             Some((kind, value)) => {
@@ -694,6 +770,10 @@ fn store_error(e: turso::Error) -> StoreError {
         _ => StoreErrorKind::Other,
     };
     StoreError::new(kind, e)
+}
+
+fn not_found(what: &str, id: u64) -> StoreError {
+    StoreError::new(StoreErrorKind::NotFound, format!("no {what} with id {id}"))
 }
 
 fn corrupt(msg: impl Into<String>) -> StoreError {

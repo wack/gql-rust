@@ -125,9 +125,11 @@ pub type StoreResult<T> = Result<T, StoreError>;
 /// [`#[async_trait]`](macro@async_trait); the returned futures are `Send`, so
 /// queries can run on a multi-threaded runtime.
 ///
-/// Ids passed in come from the same store. A backend should answer an id it
-/// does not know with [`StoreErrorKind::NotFound`] where that is cheap to
-/// detect; it must not panic.
+/// Every method that takes a node or edge id must answer an id the store
+/// does not hold with [`StoreErrorKind::NotFound`], never with an empty
+/// result: an element that exists with no labels, properties or edges must
+/// stay distinguishable from one that does not exist. Ids can come from
+/// outside the store, for example as query parameters. No method may panic.
 ///
 /// Node and edge enumeration order must be deterministic for a given graph
 /// state; SLCR relies on this for reproducible output when a query has no
